@@ -87,6 +87,14 @@ CSS = """
     font-family:"Hiragino Sans","Hiragino Kaku Gothic ProN","Noto Sans JP","Yu Gothic",sans-serif;
     font-size:16px; line-height:1.75; color:#1a1a1a; background:#f7f8fa;
   }
+  rt{font-size:11px; color:var(--grey); user-select:none; display:none}
+  body.furigana-on rt{display:ruby-text}
+  .furigana-toggle-box{position:fixed; top:20px; left:20px; z-index:50}
+  .furigana-toggle{font-family:inherit; font-size:13px; font-weight:700; color:var(--navy);
+                    background:#fff; border:1px solid var(--navy); border-radius:20px;
+                    padding:8px 18px; cursor:pointer; box-shadow:0 2px 8px rgba(0,0,0,.15)}
+  .furigana-toggle:hover{background:var(--light)}
+  body.furigana-on .furigana-toggle{background:var(--navy); color:#fff}
   .page{display:flex; align-items:flex-start; gap:24px; max-width:1120px; margin:0 auto}
   .wrap{flex:1 1 auto; min-width:0; max-width:820px; background:#fff; padding:40px 44px 48px;
         border-radius:10px; box-shadow:0 1px 4px rgba(0,0,0,.08)}
@@ -305,6 +313,17 @@ def summarize_button_html() -> str:
         '<div class="summarize-box">'
         '<span class="summarize-msg" id="summarizeMsg"></span>'
         '<button class="summarize-btn" id="summarizeBtn" type="button">まとめて</button>'
+        '</div>'
+    )
+
+
+def furigana_toggle_html() -> str:
+    """Fixed top-left toggle. Every kanji in examples/quiz questions is
+    authored with <ruby>...<rt>reading</rt></ruby>; the <rt> is hidden by
+    CSS by default and this button flips a body class to reveal it."""
+    return (
+        '<div class="furigana-toggle-box">'
+        '<button class="furigana-toggle" id="furiganaToggle" type="button">ふりがな</button>'
         '</div>'
     )
 
@@ -602,6 +621,19 @@ CHAT_JS = """
 </script>
 """
 
+FURIGANA_JS = """
+<script>
+/* 「ふりがな」トグル：文中の<ruby><rt>を表示/非表示にするだけ（CSSクラスの切り替え）。 */
+(function(){
+  var btn = document.getElementById("furiganaToggle");
+  if (!btn) return;
+  btn.addEventListener("click", function(){
+    document.body.classList.toggle("furigana-on");
+  });
+})();
+</script>
+"""
+
 SUMMARIZE_JS = """
 <script>
 /* 「まとめて」ボタン：今日のcontent JSON・クイズの解答・チャットの会話を
@@ -674,11 +706,13 @@ def build(content: dict, gifs: dict[str, str | None], out_path: str, content_fil
 
     chatbox = chatbox_html()
     summarize = summarize_button_html()
+    furigana_toggle = furigana_toggle_html()
     parts = [
         "<!DOCTYPE html>", '<html lang="ja">', "<head>", '<meta charset="utf-8">',
         '<meta name="viewport" content="width=device-width, initial-scale=1">',
         f"<title>漢字練習 {d}</title>", "<style>", CSS, "</style>", "</head>",
         f'<body data-content-file="{attr_esc(content_file)}">',
+        furigana_toggle,
         '<div class="page">', '<div class="wrap">', "", "<h1>漢字練習</h1>",
         f'<p class="sub">{d}　テーマ：<b>{esc(theme)}</b>　({level_str})</p>', "",
         '<div class="box warm">',
@@ -686,6 +720,7 @@ def build(content: dict, gifs: dict[str, str | None], out_path: str, content_fil
         '  <p class="en">まず読み方と単語を確認してから、最後の復習クイズに挑戦してください。</p>',
         '  <p class="en">※筆順アニメーションは KanjiVG（CC BY-SA 3.0）のデータから作成しています。'
         '赤ではなく画ごとに色が変わり、数字が何画目かを示します。</p>',
+        '  <p class="en">※左上の「ふりがな」ボタンで、例文とクイズの読みを表示/非表示にできます。</p>',
         "</div>", "",
     ]
     for i, k in enumerate(content["kanji"], 1):
@@ -699,6 +734,7 @@ def build(content: dict, gifs: dict[str, str | None], out_path: str, content_fil
     parts += ["</div>", chatbox, "</div>", summarize]
     parts.append(CHAT_JS)
     parts.append(SUMMARIZE_JS)
+    parts.append(FURIGANA_JS)
     parts += ["</body>", "</html>"]
     return "\n".join(parts)
 
