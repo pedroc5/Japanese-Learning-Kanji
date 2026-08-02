@@ -298,7 +298,8 @@ def chatbox_html() -> str:
         '<p class="en">今日の練習に限らず、何でも自由に質問できます。</p>'
         '<div class="chatlog" id="chatlog"></div>'
         '<div class="chatinput">'
-        '<textarea class="chatta" id="chatta" rows="2" placeholder="質問を入力してください"></textarea>'
+        '<textarea class="chatta" id="chatta" rows="2" '
+        'placeholder="質問を入力してください（Shift+Enterで送信）"></textarea>'
         '<div class="chatctl"><button class="chatsend" id="chatsend" type="button">送信</button>'
         '<span class="chat-msg" id="chatmsg"></span></div>'
         '</div></aside>'
@@ -334,7 +335,7 @@ def kanji_section(i: int, k: dict, gif_b64: str | None) -> str:
     out = [
         f'<h2>{i}. <span class="kanji">{esc(k["char"])}</span>'
         f'<span class="{lvl_cls}">{esc(level)}</span></h2>',
-        f'<p><b>音読み</b>：{esc(k.get("on", "—"))}　／　<b>訓読み</b>：{esc(k.get("kun", "—"))}</p>',
+        f'<p><b>訓読み</b>：{esc(k.get("kun", "—"))}　／　<b>音読み</b>：{esc(k.get("on", "—"))}</p>',
         f'<p class="en">意味：{esc(k.get("meaning", ""))}</p>',
     ]
     if k.get("strokes") or k.get("radical") or k.get("order_note"):
@@ -628,7 +629,7 @@ CHAT_JS = """
 
   btn.addEventListener("click", send);
   ta.addEventListener("keydown", function(e){
-    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+    if (e.key === "Enter" && e.shiftKey) { e.preventDefault(); send(); }
   });
 })();
 </script>
