@@ -2,3 +2,9 @@ __pycache__/
 *.pyc
 .kanjivg_cache/
 .claude/settings.local.json
+
+# graphify の生成物（知識グラフ・キャッシュ・コスト記録）は作り直せるので追跡しない
+graphify-out/
+
+# macOS
+.DS_Store
