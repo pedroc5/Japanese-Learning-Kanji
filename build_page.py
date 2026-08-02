@@ -381,6 +381,7 @@ def practice_section(kanji: list[dict]) -> str:
 印刷すると、紙のマス目としても使えます。</p>
 <p>
   <button class="btn" id="toggleModel">お手本を隠す</button>
+  <button class="btn sub2" id="undoStroke">一画戻す</button>
   <button class="btn sub2" id="clearAll">全部消す</button>
 </p>
 <div class="grid" id="padGrid"></div>
@@ -403,9 +404,14 @@ def practice_section(kanji: list[dict]) -> str:
     var ctx = cv.getContext("2d"); ctx.scale(dpr, dpr);
     ctx.lineWidth = 5; ctx.lineCap = "round"; ctx.lineJoin = "round"; ctx.strokeStyle = "#1a1a1a";
     var drawing = false;
+    var history = [];
+    var entry = {{pad:pad, ctx:ctx, cv:cv, history:history}};
     function pos(e){{ var r = cv.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; }}
     cv.addEventListener("pointerdown", function(e){{
       drawing = true; cv.setPointerCapture(e.pointerId);
+      activePad = entry;
+      history.push(ctx.getImageData(0, 0, cv.width, cv.height));
+      if (history.length > 40) history.shift();
       var p = pos(e); ctx.beginPath(); ctx.moveTo(p[0], p[1]);
     }});
     cv.addEventListener("pointermove", function(e){{
@@ -416,16 +422,22 @@ def practice_section(kanji: list[dict]) -> str:
     }});
     pad.appendChild(mdl); pad.appendChild(cv);
     cell.appendChild(lab); cell.appendChild(pad); grid.appendChild(cell);
-    pads.push({{pad:pad, ctx:ctx, cv:cv}});
+    pads.push(entry);
   }});
   var hidden = false;
+  var activePad = null;   // 直前に線を描いたマス（「一画戻す」が対象にする）
   document.getElementById("toggleModel").addEventListener("click", function(){{
     hidden = !hidden;
     pads.forEach(function(p){{ p.pad.classList.toggle("hide", hidden); }});
     this.textContent = hidden ? "お手本を表示" : "お手本を隠す";
   }});
+  document.getElementById("undoStroke").addEventListener("click", function(){{
+    if (!activePad || !activePad.history.length) return;
+    var img = activePad.history.pop();
+    activePad.ctx.putImageData(img, 0, 0);
+  }});
   document.getElementById("clearAll").addEventListener("click", function(){{
-    pads.forEach(function(p){{ p.ctx.clearRect(0, 0, p.cv.width, p.cv.height); }});
+    pads.forEach(function(p){{ p.ctx.clearRect(0, 0, p.cv.width, p.cv.height); p.history.length = 0; }});
   }});
 }})();
 </script>
