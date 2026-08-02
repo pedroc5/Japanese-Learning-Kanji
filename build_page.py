@@ -288,14 +288,15 @@ def attr_esc(s: str) -> str:
 
 def chatbox_html() -> str:
     """A general-purpose chat sidebar: no kanji/page context is injected —
-    Pedro can ask about anything, the same as talking to Claude Code
-    directly. The local ask_server keeps each browser tab's messages as one
-    ongoing conversation (via `claude -p --resume`), so this renders a
-    running transcript rather than a single one-off answer."""
+    Pedro can ask about anything, not just today's practice. The local
+    ask_server answers in a Japanese-teacher voice (see ASK_SYSTEM_PROMPT
+    there) and keeps each browser tab's messages as one ongoing conversation
+    (via `claude -p --resume`), so this renders a running transcript rather
+    than a single one-off answer."""
     return (
         '<aside class="chatbox">'
         '<div class="chatbox-title">Claudeに質問する</div>'
-        '<p class="en">今日の練習に限らず、何でも自由に質問できます。</p>'
+        '<p class="en">今日の練習に限らず、日本語のことなら何でも質問できます。</p>'
         '<div class="chatlog" id="chatlog"></div>'
         '<div class="chatinput">'
         '<textarea class="chatta" id="chatta" rows="2" '

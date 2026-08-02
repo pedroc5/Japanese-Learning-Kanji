@@ -33,6 +33,14 @@ SUMMARY_TIMEOUT = 240
 _sessions: dict[str, str] = {}   # conversation_id (browser-side) -> claude session_id
 _lock = threading.Lock()
 
+# サイドバーのチャット用の指示。質問文には混ぜず --append-system-prompt で渡すので、
+# 会話ログには出ず、--resume で続く各ターンにも同じように効く。
+ASK_SYSTEM_PROMPT = (
+    "Answer as a Japanese language teacher, correcting incorrect or unnatural "
+    "formulations. Use examples, definitions, and when possible backup your "
+    "answer on existing documents."
+)
+
 
 class Handler(BaseHTTPRequestHandler):
     def _cors(self) -> None:
@@ -86,7 +94,8 @@ class Handler(BaseHTTPRequestHandler):
         # --allowedTools は素の "-p" でも効くので、こちらで代替する。
         cmd = ["claude", "-p", question, "--permission-mode", "acceptEdits",
                "--allowedTools", "Read WebFetch",
-               "--output-format", "json"]
+               "--output-format", "json",
+               "--append-system-prompt", ASK_SYSTEM_PROMPT]
         if resume_sid:
             cmd += ["--resume", resume_sid]
 
