@@ -479,6 +479,7 @@ def quiz_section(quiz: list[dict]) -> str:
   var data = [
 %s
   ];
+  window.__quizKey = data;   // まとめ機能が採点済みの結果を送るのに使う
   function norm(s){
     return (s||"").trim()
       .replace(/[ァ-ヶ]/g, function(c){return String.fromCharCode(c.charCodeAt(0)-0x60);})
@@ -648,20 +649,47 @@ FURIGANA_JS = """
 
 SUMMARIZE_JS = """
 <script>
-/* 「まとめて」ボタン：今日のcontent JSON・クイズの解答・チャットの会話を
-   ローカルサーバーに送り、まとめ_<date>.html を別ファイルとして作らせる。 */
+/* 「まとめて」ボタン：今日のcontent JSONのパス・クイズの採点結果（ページ自身の答え合わせ
+   ロジックを再利用して、ここで採点する）・チャットの会話をローカルサーバーに送り、
+   まとめ_<date>.html を別ファイルとして作らせる。 */
 (function(){
   var SUMMARIZE_URL = "http://127.0.0.1:8765/summarize";
   var btn = document.getElementById("summarizeBtn");
   var msg = document.getElementById("summarizeMsg");
   if (!btn) return;
 
+  function normReading(s){
+    return (s||"").trim()
+      .replace(/[ァ-ヶ]/g, function(c){return String.fromCharCode(c.charCodeAt(0)-0x60);})
+      .replace(/[\\s　・ー]/g,"");
+  }
+
+  function questionText(li){
+    var clone = li.cloneNode(true);
+    var qline = clone.querySelector(".qline");
+    if (qline) qline.remove();
+    return clone.textContent.trim();
+  }
+
+  function gradeQuiz(){
+    var key = window.__quizKey || [];
+    var lis = document.querySelectorAll("#quiz li");
+    return Array.prototype.map.call(
+      document.querySelectorAll("input.ans"), function(inp, i){
+        var given = inp.value.trim();
+        var k = key[i] || {ok: [], alt: []};
+        var gn = normReading(given);
+        var verdict = !gn ? "未回答"
+          : (k.ok.indexOf(gn) >= 0 ? "正解" : (k.alt.indexOf(gn) >= 0 ? "惜しい" : "不正解"));
+        return {q: lis[i] ? questionText(lis[i]) : "", given: given, verdict: verdict};
+      }
+    );
+  }
+
   btn.addEventListener("click", function(){
     if (btn.disabled) return;
     var contentFile = document.body.getAttribute("data-content-file") || "";
-    var answers = Array.prototype.map.call(
-      document.querySelectorAll("input.ans"), function(i){ return i.value; }
-    );
+    var quizResults = gradeQuiz();
     var chat = Array.prototype.map.call(
       document.querySelectorAll("#chatlog .chatmsg"), function(el){
         var who = el.classList.contains("you") ? "you" : "bot";
@@ -678,7 +706,7 @@ SUMMARIZE_JS = """
     fetch(SUMMARIZE_URL, {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({content_file: contentFile, answers: answers, chat: chat})
+      body: JSON.stringify({content_file: contentFile, quiz_results: quizResults, chat: chat})
     }).then(function(r){ return r.json().then(function(d){ return {ok: r.ok, data: d}; }); })
       .then(function(res){
         btn.disabled = false;

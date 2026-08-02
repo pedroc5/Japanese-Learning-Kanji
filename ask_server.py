@@ -30,19 +30,6 @@ _sessions: dict[str, str] = {}   # conversation_id (browser-side) -> claude sess
 _lock = threading.Lock()
 
 
-def _norm(s: str) -> str:
-    """Same normalization the quiz-grading JS uses: katakana->hiragana, strip
-    whitespace/full-width space/nakaguro/chōonpu, so scoring matches what the
-    page already told Pedro when he checked his answers."""
-    s = (s or "").strip()
-    s = "".join(chr(ord(c) - 0x60) if "ァ" <= c <= "ヶ" else c for c in s)
-    return re.sub(r"[\s　・ー]", "", s)
-
-
-def _strip_tags(s: str) -> str:
-    return re.sub(r"<[^>]+>", "", s or "")
-
-
 class Handler(BaseHTTPRequestHandler):
     def _cors(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -121,7 +108,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             body = self._read_json()
             content_file = (body.get("content_file") or "").strip()
-            answers = body.get("answers") or []
+            quiz_results = body.get("quiz_results") or []
             chat = body.get("chat") or []
         except Exception:
             self._send_json(400, {"error": "リクエストが不正です。"})
@@ -142,21 +129,10 @@ class Handler(BaseHTTPRequestHandler):
         theme = content.get("theme", "")
         kanji_chars = "、".join(k.get("char", "") for k in content.get("kanji", []))
 
-        quiz_lines = []
-        for i, q in enumerate(content.get("quiz", [])):
-            given = answers[i] if i < len(answers) else ""
-            ok_set = {_norm(q.get("a", ""))} | {_norm(alt) for alt in q.get("alt", [])}
-            given_n = _norm(given)
-            if not given_n:
-                verdict = "未回答"
-            elif given_n in ok_set:
-                verdict = "正解"
-            else:
-                verdict = "不正解"
-            quiz_lines.append(
-                f"- 問題「{_strip_tags(q.get('q', ''))}」／正解「{q.get('a', '')}」／"
-                f"Pedroの解答「{given or '(空欄)'}」／判定：{verdict}"
-            )
+        quiz_lines = [
+            f"- 問題「{r.get('q', '')}」／Pedroの解答「{r.get('given') or '(空欄)'}」／判定：{r.get('verdict', '?')}"
+            for r in quiz_results
+        ]
         quiz_block = "\n".join(quiz_lines) or "(クイズの解答はまだ入力されていません)"
 
         chat_lines = [
