@@ -5,7 +5,7 @@ Pure aggregation, no new content is written by a model here: it reads
 kanji_history.json for this week's day records (kind daily/extra, skipping
 kind=review to avoid recursion), loads each day's saved content_<date>.json,
 merges all kanji (deduped) and all quiz questions, and reuses build_page's
-make_gif()/build() to assemble the same kind of self-contained HTML page.
+make_gifs()/build() to assemble the same kind of self-contained HTML page.
 
     python build_review.py --date 2026-08-01
 
@@ -15,43 +15,44 @@ See SKILL.md for how/when this gets invoked (Fridays, after the daily run).
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from datetime import date, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import build_page as bp  # noqa: E402
+import build_page  # noqa: E402
 
 
 def week_range(d: date) -> tuple[date, date]:
+    """The Monday and Sunday of the week containing `d`."""
     monday = d - timedelta(days=d.weekday())
     sunday = monday + timedelta(days=6)
     return monday, sunday
 
 
-def main() -> int:
-    p = argparse.ArgumentParser(description="今週分の漢字練習をまとめた復習ページを作る")
-    p.add_argument("--date", default=date.today().isoformat(), help="この日を含む週を復習する（既定：今日）")
-    p.add_argument("--history", type=Path, default=bp.DEFAULT_HISTORY)
-    p.add_argument("--out", type=Path, help="出力HTML（既定：<historyの親>/復習_<date>.html）")
-    p.add_argument("--gifdir", type=Path, default=Path.home() / "Documents" / "Claude-JP" / "漢字" / "gif")
-    p.add_argument("--maker", type=Path, default=bp.DEFAULT_MAKER)
-    p.add_argument("--size", type=int, default=240)
-    p.add_argument("--skip-gif", action="store_true")
-    p.add_argument("--conda-env", default="kanji")
-    a = p.parse_args()
+def week_days(history: dict, monday: date, sunday: date) -> list[dict]:
+    """This week's day records, oldest first.
 
-    d = date.fromisoformat(a.date)
-    monday, sunday = week_range(d)
-
-    hist = bp.load_history(a.history)
+    Review days are skipped so a re-run doesn't fold last week's review page
+    back into the new one.
+    """
     days = [
-        day for day in hist["days"]
+        day for day in history["days"]
         if day.get("kind") != "review" and day.get("content_file")
         and monday <= date.fromisoformat(day["date"]) <= sunday
     ]
-    days.sort(key=lambda x: x["date"])
+    days.sort(key=lambda day: day["date"])
+    return days
 
+
+def collect_week(days: list[dict]) -> tuple[list[dict], list[dict], list[str], list[str]]:
+    """Load each day's saved content and merge it.
+
+    Returns (kanji deduped by character, all quiz questions, themes in order,
+    the dates that actually contributed). A day whose content file has since
+    been deleted is reported and skipped.
+    """
     seen_chars: set[str] = set()
     merged_kanji: list[dict] = []
     merged_quiz: list[dict] = []
@@ -59,22 +60,46 @@ def main() -> int:
     used_dates: list[str] = []
 
     for day in days:
-        cf = Path(day["content_file"])
-        if not cf.exists():
-            print(f"  ! {cf} が見つからないためスキップします", file=sys.stderr)
+        content_file = Path(day["content_file"])
+        if not content_file.exists():
+            print(f"  ! {content_file} が見つからないためスキップします", file=sys.stderr)
             continue
-        import json
-        day_content = json.loads(cf.read_text(encoding="utf-8"))
-        for k in day_content.get("kanji", []):
-            if k["char"] not in seen_chars:
-                seen_chars.add(k["char"])
-                merged_kanji.append(k)
+        day_content = json.loads(content_file.read_text(encoding="utf-8"))
+
+        for entry in day_content.get("kanji", []):
+            if entry["char"] not in seen_chars:
+                seen_chars.add(entry["char"])
+                merged_kanji.append(entry)
         merged_quiz.extend(day_content.get("quiz", []))
+
         theme = day.get("theme") or day_content.get("theme", "")
         if theme and theme not in themes:
             themes.append(theme)
         if day["date"] not in used_dates:
             used_dates.append(day["date"])
+
+    return merged_kanji, merged_quiz, themes, used_dates
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="今週分の漢字練習をまとめた復習ページを作る")
+    parser.add_argument("--date", default=date.today().isoformat(),
+                        help="この日を含む週を復習する（既定：今日）")
+    parser.add_argument("--history", type=Path, default=build_page.DEFAULT_HISTORY)
+    parser.add_argument("--out", type=Path, help="出力HTML（既定：<historyの親>/復習_<date>.html）")
+    parser.add_argument("--gifdir", type=Path,
+                        default=Path.home() / "Documents" / "Claude-JP" / "漢字" / "gif")
+    parser.add_argument("--maker", type=Path, default=build_page.DEFAULT_MAKER)
+    parser.add_argument("--size", type=int, default=240)
+    parser.add_argument("--skip-gif", action="store_true")
+    parser.add_argument("--conda-env", default="kanji")
+    args = parser.parse_args()
+
+    monday, sunday = week_range(date.fromisoformat(args.date))
+
+    history = build_page.load_history(args.history)
+    merged_kanji, merged_quiz, themes, used_dates = collect_week(
+        week_days(history, monday, sunday))
 
     if not merged_kanji:
         print(f"今週（{monday.isoformat()}〜{sunday.isoformat()}）分の記録が見つからないため、"
@@ -83,7 +108,7 @@ def main() -> int:
 
     theme_str = "・".join(themes) if themes else "今週のまとめ"
     merged_content = {
-        "date": a.date,
+        "date": args.date,
         "theme": f"今週の復習（{monday.isoformat()}〜{sunday.isoformat()}）：{theme_str}",
         "kanji": merged_kanji,
         "quiz": merged_quiz,
@@ -91,22 +116,20 @@ def main() -> int:
 
     gifs: dict[str, str | None] = {}
     failed: list[str] = []
-    if not a.skip_gif:
-        for k in merged_kanji:
-            print(f"  … {k['char']} のGIFを作成中")
-            gifs[k["char"]] = bp.make_gif(k["char"], a.gifdir, a.maker, a.size, a.conda_env)
-            if not gifs[k["char"]]:
-                failed.append(k["char"])
+    if not args.skip_gif:
+        gifs, failed = build_page.make_gifs(merged_kanji, args.gifdir, args.maker,
+                                            args.size, args.conda_env)
 
-    out = a.out or (a.history.parent / f"復習_{a.date}.html")
+    out = args.out or (args.history.parent / f"復習_{args.date}.html")
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(bp.build(merged_content, gifs, str(out)), encoding="utf-8")
+    out.write_text(build_page.build(merged_content, gifs), encoding="utf-8")
 
-    bp.update_history(hist, merged_content, "review", a.date, str(out))
-    bp.save_history(a.history, hist)
+    build_page.update_history(history, merged_content, "review", args.date, str(out))
+    build_page.save_history(args.history, history)
 
-    ok = sum(1 for v in gifs.values() if v)
-    print(f"完了：{out}（{len(used_dates)}日分・{len(merged_kanji)}字・GIF {ok}/{len(merged_kanji)}）")
+    made = sum(1 for gif in gifs.values() if gif)
+    print(f"完了：{out}（{len(used_dates)}日分・{len(merged_kanji)}字・"
+          f"GIF {made}/{len(merged_kanji)}）")
     if failed:
         print(f"警告: GIFを作れなかった字があります — {'・'.join(failed)}", file=sys.stderr)
         return 1

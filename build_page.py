@@ -29,52 +29,13 @@ DEFAULT_HISTORY = Path.home() / "Documents" / "Claude-JP" / "漢字" / "kanji_hi
 
 
 # --------------------------------------------------------------------------- #
-# 履歴（過去に使った字・テーマを二度と繰り返さないための記録）
+# Embedded page assets
+#
+# Everything below is copied verbatim into the generated HTML. Only PLAYER_JS
+# is templated (its %s takes the gifdec.js source). Edit with care: the pages
+# are self-contained, so a browser only ever sees this copy.
 # --------------------------------------------------------------------------- #
 
-def load_history(path: Path) -> dict:
-    if path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))
-    return {"kanji": {}, "days": []}
-
-
-def save_history(path: Path, hist: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(hist, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def update_history(hist: dict, content: dict, kind: str, d: str, content_file: str) -> list[str]:
-    """Record this day's kanji/theme in the history. Returns chars that were
-    already present on a DIFFERENT date (a real repeat — the selection step
-    should have caught this via load_history(), so it's surfaced as a
-    warning, not silently ignored). Re-processing the same date (e.g. a
-    same-day extra class gets merged into the existing page and the whole
-    merged content is re-saved) is not a repeat — matched by date, not
-    silently skipped, or every kanji from the earlier class in the same day
-    would falsely show up as a dupe. Review days aggregate kanji that are
-    already known, so they don't touch the kanji dict at all."""
-    dupes: list[str] = []
-    chars = [k["char"] for k in content["kanji"]]
-    if kind != "review":
-        for k in content["kanji"]:
-            char = k["char"]
-            existing = hist["kanji"].get(char)
-            if existing and existing["date"] != d:
-                dupes.append(char)
-            else:
-                hist["kanji"][char] = {
-                    "date": d, "level": k.get("level", "?"), "theme": content.get("theme", ""),
-                }
-    day = next((day for day in hist["days"]
-                if day.get("date") == d and day.get("content_file") == content_file), None)
-    if day:
-        day["kind"], day["theme"], day["chars"] = kind, content.get("theme", ""), chars
-    else:
-        hist["days"].append({
-            "date": d, "kind": kind, "theme": content.get("theme", ""),
-            "chars": chars, "content_file": content_file,
-        })
-    return dupes
 
 CSS = """
   :root{
@@ -237,278 +198,6 @@ CSS = """
 """
 
 
-# --------------------------------------------------------------------------- #
-# GIF
-# --------------------------------------------------------------------------- #
-
-def make_gif(char: str, gifdir: Path, maker: Path, size: int, conda_env: str) -> str | None:
-    """Generate (or reuse) the stroke-order GIF and return it base64-encoded.
-
-    kanji_gif.py needs svgpathtools/Pillow/requests, which only live in the
-    `conda_env` conda environment. We always shell out via `conda run -n
-    <conda_env>` instead of reusing sys.executable, because build_page.py
-    itself may get invoked with a different interpreter (e.g. someone runs
-    `python build_page.py` directly) that lacks those packages — that
-    mismatch used to fail every single kanji silently (caught exception,
-    printed only to stderr, page still written with placeholders).
-    """
-    cp = "%05x" % ord(char)
-    out = gifdir / f"{cp}.gif"
-    if not out.exists():
-        gifdir.mkdir(parents=True, exist_ok=True)
-        cmd = ["conda", "run", "-n", conda_env, "python", str(maker), KVG_RAW.format(cp=cp),
-               "--outdir", str(gifdir), "--size", str(size), "--grid",
-               "--cache-dir", str(DEFAULT_SVG_CACHE)]
-        try:
-            subprocess.run(cmd, check=True, capture_output=True, timeout=300)
-        except subprocess.CalledProcessError as e:
-            detail = (e.stderr or b"").decode(errors="replace").strip().splitlines()
-            tail = detail[-1] if detail else "(詳細なし)"
-            print(f"  ! {char} ({cp}): GIF生成に失敗 — {tail}", file=sys.stderr)
-            return None
-        except Exception as e:                       # noqa: BLE001
-            print(f"  ! {char} ({cp}): GIF生成に失敗 — {e}", file=sys.stderr)
-            return None
-    if not out.exists():
-        return None
-    return base64.b64encode(out.read_bytes()).decode()
-
-
-# --------------------------------------------------------------------------- #
-# HTML
-# --------------------------------------------------------------------------- #
-
-def esc(s: str) -> str:
-    return html.escape(str(s), quote=False)
-
-
-def attr_esc(s: str) -> str:
-    return html.escape(str(s), quote=True)
-
-
-def chatbox_html() -> str:
-    """A general-purpose chat sidebar: no kanji/page context is injected —
-    Pedro can ask about anything, not just today's practice. The local
-    ask_server answers in a Japanese-teacher voice (see ASK_SYSTEM_PROMPT
-    there) and keeps each browser tab's messages as one ongoing conversation
-    (via `claude -p --resume`), so this renders a running transcript rather
-    than a single one-off answer."""
-    return (
-        '<aside class="chatbox">'
-        '<div class="chatbox-title">Claudeに質問する</div>'
-        '<p class="en">今日の練習に限らず、日本語のことなら何でも質問できます。</p>'
-        '<div class="chatlog" id="chatlog"></div>'
-        '<div class="chatinput">'
-        '<textarea class="chatta" id="chatta" rows="2" '
-        'placeholder="質問を入力してください（Shift+Enterで送信）"></textarea>'
-        '<div class="chatctl"><button class="chatsend" id="chatsend" type="button">送信</button>'
-        '<span class="chat-msg" id="chatmsg"></span></div>'
-        '</div></aside>'
-    )
-
-
-def summarize_button_html() -> str:
-    """Fixed bottom-right button that asks the local server to write a
-    separate まとめ_<date>.html recapping today's kanji, quiz answers (read
-    live from the quiz inputs), and the chat conversation so far."""
-    return (
-        '<div class="summarize-box">'
-        '<span class="summarize-msg" id="summarizeMsg"></span>'
-        '<button class="summarize-btn" id="summarizeBtn" type="button">まとめて</button>'
-        '</div>'
-    )
-
-
-def furigana_toggle_html() -> str:
-    """Fixed top-left toggle. Every kanji in examples/quiz questions is
-    authored with <ruby>...<rt>reading</rt></ruby>; the <rt> is hidden by
-    CSS by default and this button flips a body class to reveal it."""
-    return (
-        '<div class="furigana-toggle-box">'
-        '<button class="furigana-toggle" id="furiganaToggle" type="button">ふりがな</button>'
-        '</div>'
-    )
-
-
-def kanji_section(i: int, k: dict, gif_b64: str | None) -> str:
-    level = k.get("level", "N3").upper()
-    lvl_cls = f"lvl n{level[1:]}" if level.startswith("N") and level[1:].isdigit() else "lvl"
-    out = [
-        f'<h2>{i}. <span class="kanji">{esc(k["char"])}</span>'
-        f'<span class="{lvl_cls}">{esc(level)}</span></h2>',
-        f'<p><b>訓読み</b>：{esc(k.get("kun", "—"))}　／　<b>音読み</b>：{esc(k.get("on", "—"))}</p>',
-        f'<p class="en">意味：{esc(k.get("meaning", ""))}</p>',
-    ]
-    if k.get("strokes") or k.get("radical") or k.get("order_note"):
-        bits = []
-        if k.get("strokes"):
-            bits.append(f'{esc(k["strokes"])}画')
-        if k.get("radical"):
-            bits.append(f'部首：{esc(k["radical"])}')
-        if k.get("order_note"):
-            bits.append(f'書き順：{esc(k["order_note"])}')
-        out.append(f'<p class="en"><b>書き方</b>：{"　".join(bits)}</p>')
-
-    n = k.get("strokes", "")
-    body = (f'<img src="data:image/gif;base64,{gif_b64}" alt="「{esc(k["char"])}」の筆順">'
-            if gif_b64 else '<div class="wait">GIFを作れませんでした</div>')
-    out.append(
-        '<div class="anim">'
-        f'<div class="player">{body}</div>'
-        f'<span class="cap"><b>「{esc(k["char"])}」の筆順'
-        f'{f"（{esc(n)}画）" if n else ""}</b><br>'
-        '<span class="ctl"><button class="replay" type="button">もう一度見る</button>'
-        '<label>速さ <input type="range" class="spd" min="0.25" max="3" step="0.25" value="1"></label>'
-        '<b class="spdv">×1.0</b></span></span></div>'
-    )
-
-    rows = "\n".join(
-        f'    <tr><td class="word">{esc(w["w"])}</td><td>{esc(w["r"])}</td><td>{esc(w.get("m", ""))}</td></tr>'
-        for w in k.get("words", [])
-    )
-    out.append('<table>\n  <thead><tr><th>単語</th><th>読み</th><th>意味</th></tr></thead>\n'
-               f'  <tbody>\n{rows}\n  </tbody>\n</table>')
-    for ex in k.get("examples", []):
-        out.append(f'<p class="ex">・{ex}</p>')      # 例文は <b> を含むので escape しない
-    return "\n".join(out)
-
-
-def practice_section(kanji: list[dict]) -> str:
-    items = ", ".join(
-        '["%s","%s画"]' % (k["char"], k.get("strokes", "")) for k in kanji
-    )
-    return f"""
-<h2>書き取り練習(マウス・指で書いてみましょう)</h2>
-<p class="en">うすいお手本の上をなぞってから、「お手本を隠す」を押して、何も見ないで書いてみてください。
-印刷すると、紙のマス目としても使えます。</p>
-<p>
-  <button class="btn" id="toggleModel">お手本を隠す</button>
-  <button class="btn sub2" id="undoStroke">一画戻す</button>
-  <button class="btn sub2" id="clearAll">全部消す</button>
-</p>
-<div class="grid" id="padGrid"></div>
-<div class="box">
-  <p class="en">書き順の基本ルール：①上から下へ　②左から右へ　③横画→縦画　④外側の囲み→中身→最後にふた　⑤左のへんを先に書く。</p>
-</div>
-<script>
-(function(){{
-  var list = [{items}];
-  var grid = document.getElementById("padGrid"), pads = [];
-  list.forEach(function(item){{
-    var cell = document.createElement("div"); cell.className = "cell";
-    var lab = document.createElement("div"); lab.className = "label";
-    lab.textContent = item[0] + "（" + item[1] + "）";
-    var pad = document.createElement("div"); pad.className = "pad";
-    var mdl = document.createElement("div"); mdl.className = "model"; mdl.textContent = item[0];
-    var cv = document.createElement("canvas");
-    var dpr = window.devicePixelRatio || 1;
-    cv.width = 112 * dpr; cv.height = 112 * dpr;
-    var ctx = cv.getContext("2d"); ctx.scale(dpr, dpr);
-    ctx.lineWidth = 5; ctx.lineCap = "round"; ctx.lineJoin = "round"; ctx.strokeStyle = "#1a1a1a";
-    var drawing = false;
-    var history = [];
-    var entry = {{pad:pad, ctx:ctx, cv:cv, history:history}};
-    function pos(e){{ var r = cv.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; }}
-    cv.addEventListener("pointerdown", function(e){{
-      drawing = true; cv.setPointerCapture(e.pointerId);
-      activePad = entry;
-      history.push(ctx.getImageData(0, 0, cv.width, cv.height));
-      if (history.length > 40) history.shift();
-      var p = pos(e); ctx.beginPath(); ctx.moveTo(p[0], p[1]);
-    }});
-    cv.addEventListener("pointermove", function(e){{
-      if(!drawing) return; var p = pos(e); ctx.lineTo(p[0], p[1]); ctx.stroke();
-    }});
-    ["pointerup","pointercancel","pointerleave"].forEach(function(t){{
-      cv.addEventListener(t, function(){{ drawing = false; }});
-    }});
-    pad.appendChild(mdl); pad.appendChild(cv);
-    cell.appendChild(lab); cell.appendChild(pad); grid.appendChild(cell);
-    pads.push(entry);
-  }});
-  var hidden = false;
-  var activePad = null;   // 直前に線を描いたマス（「一画戻す」が対象にする）
-  document.getElementById("toggleModel").addEventListener("click", function(){{
-    hidden = !hidden;
-    pads.forEach(function(p){{ p.pad.classList.toggle("hide", hidden); }});
-    this.textContent = hidden ? "お手本を表示" : "お手本を隠す";
-  }});
-  document.getElementById("undoStroke").addEventListener("click", function(){{
-    if (!activePad || !activePad.history.length) return;
-    var img = activePad.history.pop();
-    activePad.ctx.putImageData(img, 0, 0);
-  }});
-  document.getElementById("clearAll").addEventListener("click", function(){{
-    pads.forEach(function(p){{ p.ctx.clearRect(0, 0, p.cv.width, p.cv.height); p.history.length = 0; }});
-  }});
-}})();
-</script>
-"""
-
-
-def quiz_section(quiz: list[dict]) -> str:
-    qs, answers, data = [], [], []
-    for i, q in enumerate(quiz):
-        qs.append(f'  <li>{q["q"]}\n'
-                  f'    <div class="qline"><input class="ans" data-q="{i}" placeholder="ひらがなで入力">'
-                  f'<span class="res" data-r="{i}"></span></div></li>')
-        note = q.get("note", "")
-        answers.append(f'    <li>{esc(q["a"])}{("（" + esc(note) + "）") if note else ""}</li>')
-        alts = json.dumps(q.get("alt", []), ensure_ascii=False)
-        data.append('    {ok:["%s"], alt:%s, exp:"%s"}' % (q["a"], alts, esc(note)))
-    return """
-<h2>復習クイズ(読み方をひらがなで書いてください)</h2>
-<p class="en">下の欄に入力して、「答え合わせ」ボタンを押すと、正しいか正しくないかを説明します。</p>
-<ol id="quiz">
-%s
-</ol>
-
-<p>
-  <button class="btn" id="check">答え合わせ</button>
-  <button class="btn sub2" id="reset">やり直す</button>
-  <span class="res" id="score"></span>
-</p>
-
-<details>
-  <summary>解答を表示</summary>
-  <ol>
-%s
-  </ol>
-</details>
-
-<script>
-(function(){
-  var data = [
-%s
-  ];
-  window.__quizKey = data;   // まとめ機能が採点済みの結果を送るのに使う
-  function norm(s){
-    return (s||"").trim()
-      .replace(/[ァ-ヶ]/g, function(c){return String.fromCharCode(c.charCodeAt(0)-0x60);})
-      .replace(/[\\s　・ー]/g,"");
-  }
-  document.getElementById("check").addEventListener("click", function(){
-    var n=0;
-    data.forEach(function(d,i){
-      var inp=document.querySelector('input[data-q="'+i+'"]');
-      var out=document.querySelector('span[data-r="'+i+'"]');
-      var v=norm(inp.value);
-      if(!v){ out.innerHTML='<span style="color:#666">まだ答えていません。</span>'; return; }
-      if(d.ok.indexOf(v)>=0){ n++; out.innerHTML='<span class="ok">〇 正しいです。</span> '+d.exp; }
-      else if(d.alt.indexOf(v)>=0){ out.innerHTML='<span class="ng">△ おしい！</span> 正しい答えは <b>'+d.ok[0]+'</b> です。'+d.exp; }
-      else { out.innerHTML='<span class="ng">✕ 正しくありません。</span> 正しい答えは <b>'+d.ok[0]+'</b> です。'+d.exp; }
-    });
-    document.getElementById("score").innerHTML='　<b>'+n+' ／ '+data.length+' 問正解</b>';
-  });
-  document.getElementById("reset").addEventListener("click", function(){
-    document.querySelectorAll("input.ans").forEach(function(i){i.value="";});
-    document.querySelectorAll("span.res").forEach(function(s){s.innerHTML="";});
-  });
-})();
-</script>
-""" % ("\n".join(qs), "\n".join(answers), ",\n".join(data))
-
-
 PLAYER_JS = """
 <script>
 /* 埋め込みGIFを解析して canvas で再生する（速さ調整・もう一度・最後で停止） */
@@ -548,6 +237,7 @@ PLAYER_JS = """
 })();
 </script>
 """
+
 
 CHAT_JS = """
 <script>
@@ -636,6 +326,7 @@ CHAT_JS = """
 </script>
 """
 
+
 FURIGANA_JS = """
 <script>
 /* 「ふりがな」トグル：文中の<ruby><rt>を表示/非表示にするだけ（CSSクラスの切り替え）。 */
@@ -648,6 +339,7 @@ FURIGANA_JS = """
 })();
 </script>
 """
+
 
 SUMMARIZE_JS = """
 <script>
@@ -734,29 +426,439 @@ SUMMARIZE_JS = """
 """
 
 
-def build(content: dict, gifs: dict[str, str | None], out_path: str, content_file: str = "") -> str:
-    d = content.get("date") or date.today().isoformat()
-    theme = content.get("theme", "")
-    chars = "・".join(k["char"] for k in content["kanji"])
-    counts: dict[str, int] = {}
-    for k in content["kanji"]:
-        lvl = k.get("level", "N3").upper()
-        counts[lvl] = counts.get(lvl, 0) + 1
-    level_order = ["N5", "N4", "N3", "N2", "N1"]
-    ordered = [lvl for lvl in level_order if lvl in counts] + [lvl for lvl in counts if lvl not in level_order]
-    level_str = "／".join(f"{lvl} {counts[lvl]}字" for lvl in ordered)
+# --------------------------------------------------------------------------- #
+# 履歴（過去に使った字・テーマを二度と繰り返さないための記録）
+# --------------------------------------------------------------------------- #
 
-    chatbox = chatbox_html()
-    summarize = summarize_button_html()
-    furigana_toggle = furigana_toggle_html()
+
+def load_history(path: Path) -> dict:
+    """Read the history file, or return an empty one if it doesn't exist yet.
+
+    Shape: {"kanji": {char: {date, level, theme}}, "days": [day records]}.
+    """
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8"))
+    return {"kanji": {}, "days": []}
+
+
+def save_history(path: Path, history: dict) -> None:
+    """Write the history back out, creating its folder if needed."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def update_history(
+    history: dict, content: dict, kind: str, day: str, content_file: str
+) -> list[str]:
+    """Record this day's kanji and theme, and report any accidental repeats.
+
+    Returns the characters that were already recorded under a DIFFERENT date.
+    Those are real repeats: the selection step is supposed to rule them out by
+    reading the history first, so they're surfaced as a warning rather than
+    being silently accepted.
+
+    Two cases deliberately do NOT count as repeats:
+
+    - Same date. A same-day extra class merges into the existing page and the
+      whole merged content is saved again, so every kanji from the earlier
+      class would otherwise show up as a duplicate of itself.
+    - `kind == "review"`. Review pages re-present kanji that are already known,
+      so they never touch the per-kanji dict at all.
+    """
+    dupes: list[str] = []
+    chars = [kanji["char"] for kanji in content["kanji"]]
+
+    if kind != "review":
+        for kanji in content["kanji"]:
+            char = kanji["char"]
+            existing = history["kanji"].get(char)
+            if existing and existing["date"] != day:
+                dupes.append(char)
+            else:
+                history["kanji"][char] = {
+                    "date": day, "level": kanji.get("level", "?"),
+                    "theme": content.get("theme", ""),
+                }
+
+    # One record per (date, content file), so re-running a day updates its
+    # existing entry instead of appending a second one.
+    record = next((r for r in history["days"]
+                   if r.get("date") == day and r.get("content_file") == content_file), None)
+    if record:
+        record["kind"], record["theme"], record["chars"] = kind, content.get("theme", ""), chars
+    else:
+        history["days"].append({
+            "date": day, "kind": kind, "theme": content.get("theme", ""),
+            "chars": chars, "content_file": content_file,
+        })
+    return dupes
+
+
+# --------------------------------------------------------------------------- #
+# Stroke-order GIFs
+# --------------------------------------------------------------------------- #
+
+def make_gif(char: str, gifdir: Path, maker: Path, size: int, conda_env: str) -> str | None:
+    """Generate (or reuse) one kanji's stroke-order GIF, base64-encoded.
+
+    Returns None if the GIF could not be produced; the caller renders a
+    placeholder in its place rather than failing the whole page.
+
+    kanji_gif.py needs svgpathtools/Pillow/requests, which only live in the
+    `conda_env` conda environment. We always shell out via `conda run -n
+    <conda_env>` instead of reusing sys.executable, because build_page.py
+    itself may get invoked with a different interpreter (e.g. someone runs
+    `python build_page.py` directly) that lacks those packages — that
+    mismatch used to fail every single kanji silently (caught exception,
+    printed only to stderr, page still written with placeholders).
+    """
+    codepoint = "%05x" % ord(char)          # KanjiVG names its files by codepoint
+    gif_path = gifdir / f"{codepoint}.gif"
+
+    if not gif_path.exists():
+        gifdir.mkdir(parents=True, exist_ok=True)
+        cmd = ["conda", "run", "-n", conda_env, "python", str(maker),
+               KVG_RAW.format(cp=codepoint),
+               "--outdir", str(gifdir), "--size", str(size), "--grid",
+               "--cache-dir", str(DEFAULT_SVG_CACHE)]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, timeout=300)
+        except subprocess.CalledProcessError as e:
+            detail = (e.stderr or b"").decode(errors="replace").strip().splitlines()
+            tail = detail[-1] if detail else "(詳細なし)"
+            print(f"  ! {char} ({codepoint}): GIF生成に失敗 — {tail}", file=sys.stderr)
+            return None
+        except Exception as e:                       # noqa: BLE001
+            print(f"  ! {char} ({codepoint}): GIF生成に失敗 — {e}", file=sys.stderr)
+            return None
+
+    if not gif_path.exists():
+        return None
+    return base64.b64encode(gif_path.read_bytes()).decode()
+
+
+def make_gifs(kanji: list[dict], gifdir: Path, maker: Path, size: int,
+              conda_env: str) -> tuple[dict[str, str | None], list[str]]:
+    """Render every kanji's GIF, reporting progress as it goes.
+
+    Returns (char -> base64 GIF or None, list of chars that failed). Shared by
+    the daily page and the weekly review page.
+    """
+    gifs: dict[str, str | None] = {}
+    failed: list[str] = []
+    for entry in kanji:
+        char = entry["char"]
+        print(f"  … {char} のGIFを作成中")
+        gifs[char] = make_gif(char, gifdir, maker, size, conda_env)
+        if not gifs[char]:
+            failed.append(char)
+    return gifs, failed
+
+
+# --------------------------------------------------------------------------- #
+# HTML
+# --------------------------------------------------------------------------- #
+
+def esc(s: str) -> str:
+    """Escape text for HTML body content (quotes left alone — see attr_esc)."""
+    return html.escape(str(s), quote=False)
+
+
+def attr_esc(s: str) -> str:
+    """Escape text destined for an HTML attribute value."""
+    return html.escape(str(s), quote=True)
+
+
+def chatbox_html() -> str:
+    """A general-purpose chat sidebar: no kanji/page context is injected —
+    Pedro can ask about anything, not just today's practice. The local
+    ask_server answers in a Japanese-teacher voice (see ASK_SYSTEM_PROMPT
+    there) and keeps each browser tab's messages as one ongoing conversation
+    (via `claude -p --resume`), so this renders a running transcript rather
+    than a single one-off answer."""
+    return (
+        '<aside class="chatbox">'
+        '<div class="chatbox-title">Claudeに質問する</div>'
+        '<p class="en">今日の練習に限らず、日本語のことなら何でも質問できます。</p>'
+        '<div class="chatlog" id="chatlog"></div>'
+        '<div class="chatinput">'
+        '<textarea class="chatta" id="chatta" rows="2" '
+        'placeholder="質問を入力してください（Shift+Enterで送信）"></textarea>'
+        '<div class="chatctl"><button class="chatsend" id="chatsend" type="button">送信</button>'
+        '<span class="chat-msg" id="chatmsg"></span></div>'
+        '</div></aside>'
+    )
+
+
+def summarize_button_html() -> str:
+    """Fixed bottom-right button that asks the local server to write a
+    separate まとめ_<date>.html recapping today's kanji, quiz answers (read
+    live from the quiz inputs), and the chat conversation so far."""
+    return (
+        '<div class="summarize-box">'
+        '<span class="summarize-msg" id="summarizeMsg"></span>'
+        '<button class="summarize-btn" id="summarizeBtn" type="button">まとめて</button>'
+        '</div>'
+    )
+
+
+def furigana_toggle_html() -> str:
+    """Fixed top-left toggle. Every kanji in examples/quiz questions is
+    authored with <ruby>...<rt>reading</rt></ruby>; the <rt> is hidden by
+    CSS by default and this button flips a body class to reveal it."""
+    return (
+        '<div class="furigana-toggle-box">'
+        '<button class="furigana-toggle" id="furiganaToggle" type="button">ふりがな</button>'
+        '</div>'
+    )
+
+
+def kanji_section(i: int, kanji: dict, gif_b64: str | None) -> str:
+    """One kanji's block: heading, readings, stroke-order player, words, examples.
+
+    `i` is the 1-based position used in the heading.
+    """
+    char = kanji["char"]
+    level = kanji.get("level", "N3").upper()
+    # "N2" -> "lvl n2" so the CSS can colour-code the badge; anything unexpected
+    # falls back to the plain badge.
+    level_class = f"lvl n{level[1:]}" if level.startswith("N") and level[1:].isdigit() else "lvl"
+
+    parts = [
+        f'<h2>{i}. <span class="kanji">{esc(char)}</span>'
+        f'<span class="{level_class}">{esc(level)}</span></h2>',
+        f'<p><b>訓読み</b>：{esc(kanji.get("kun", "—"))}　／　'
+        f'<b>音読み</b>：{esc(kanji.get("on", "—"))}</p>',
+        f'<p class="en">意味：{esc(kanji.get("meaning", ""))}</p>',
+    ]
+
+    # 書き方 line — only rendered if at least one of its pieces is present.
+    writing_bits = []
+    if kanji.get("strokes"):
+        writing_bits.append(f'{esc(kanji["strokes"])}画')
+    if kanji.get("radical"):
+        writing_bits.append(f'部首：{esc(kanji["radical"])}')
+    if kanji.get("order_note"):
+        writing_bits.append(f'書き順：{esc(kanji["order_note"])}')
+    if writing_bits:
+        parts.append(f'<p class="en"><b>書き方</b>：{"　".join(writing_bits)}</p>')
+
+    strokes = kanji.get("strokes", "")
+    player = (f'<img src="data:image/gif;base64,{gif_b64}" alt="「{esc(char)}」の筆順">'
+              if gif_b64 else '<div class="wait">GIFを作れませんでした</div>')
+    parts.append(
+        '<div class="anim">'
+        f'<div class="player">{player}</div>'
+        f'<span class="cap"><b>「{esc(char)}」の筆順'
+        f'{f"（{esc(strokes)}画）" if strokes else ""}</b><br>'
+        '<span class="ctl"><button class="replay" type="button">もう一度見る</button>'
+        '<label>速さ <input type="range" class="spd" min="0.25" max="3" step="0.25" value="1"></label>'
+        '<b class="spdv">×1.0</b></span></span></div>'
+    )
+
+    # words entries are {"w": word, "r": reading, "m": meaning}
+    rows = "\n".join(
+        f'    <tr><td class="word">{esc(word["w"])}</td>'
+        f'<td>{esc(word["r"])}</td><td>{esc(word.get("m", ""))}</td></tr>'
+        for word in kanji.get("words", [])
+    )
+    parts.append('<table>\n  <thead><tr><th>単語</th><th>読み</th><th>意味</th></tr></thead>\n'
+                 f'  <tbody>\n{rows}\n  </tbody>\n</table>')
+
+    for example in kanji.get("examples", []):
+        parts.append(f'<p class="ex">・{example}</p>')  # 例文は <b> や <ruby> を含むので escape しない
+    return "\n".join(parts)
+
+
+def practice_section(kanji: list[dict]) -> str:
+    """The handwriting grid: one canvas per kanji, with a faint model to trace.
+
+    Note this is an f-string, so every literal brace in the JS below is doubled.
+    """
+    # A JS array literal of [character, "N画"] pairs, e.g. ["雷","13画"].
+    items = ", ".join(
+        '["%s","%s画"]' % (entry["char"], entry.get("strokes", "")) for entry in kanji
+    )
+    return f"""
+<h2>書き取り練習(マウス・指で書いてみましょう)</h2>
+<p class="en">うすいお手本の上をなぞってから、「お手本を隠す」を押して、何も見ないで書いてみてください。
+印刷すると、紙のマス目としても使えます。</p>
+<p>
+  <button class="btn" id="toggleModel">お手本を隠す</button>
+  <button class="btn sub2" id="undoStroke">一画戻す</button>
+  <button class="btn sub2" id="clearAll">全部消す</button>
+</p>
+<div class="grid" id="padGrid"></div>
+<div class="box">
+  <p class="en">書き順の基本ルール：①上から下へ　②左から右へ　③横画→縦画　④外側の囲み→中身→最後にふた　⑤左のへんを先に書く。</p>
+</div>
+<script>
+(function(){{
+  var list = [{items}];
+  var grid = document.getElementById("padGrid"), pads = [];
+  list.forEach(function(item){{
+    var cell = document.createElement("div"); cell.className = "cell";
+    var lab = document.createElement("div"); lab.className = "label";
+    lab.textContent = item[0] + "（" + item[1] + "）";
+    var pad = document.createElement("div"); pad.className = "pad";
+    var mdl = document.createElement("div"); mdl.className = "model"; mdl.textContent = item[0];
+    var cv = document.createElement("canvas");
+    var dpr = window.devicePixelRatio || 1;
+    cv.width = 112 * dpr; cv.height = 112 * dpr;
+    var ctx = cv.getContext("2d"); ctx.scale(dpr, dpr);
+    ctx.lineWidth = 5; ctx.lineCap = "round"; ctx.lineJoin = "round"; ctx.strokeStyle = "#1a1a1a";
+    var drawing = false;
+    var history = [];
+    var entry = {{pad:pad, ctx:ctx, cv:cv, history:history}};
+    function pos(e){{ var r = cv.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; }}
+    cv.addEventListener("pointerdown", function(e){{
+      drawing = true; cv.setPointerCapture(e.pointerId);
+      activePad = entry;
+      history.push(ctx.getImageData(0, 0, cv.width, cv.height));
+      if (history.length > 40) history.shift();
+      var p = pos(e); ctx.beginPath(); ctx.moveTo(p[0], p[1]);
+    }});
+    cv.addEventListener("pointermove", function(e){{
+      if(!drawing) return; var p = pos(e); ctx.lineTo(p[0], p[1]); ctx.stroke();
+    }});
+    ["pointerup","pointercancel","pointerleave"].forEach(function(t){{
+      cv.addEventListener(t, function(){{ drawing = false; }});
+    }});
+    pad.appendChild(mdl); pad.appendChild(cv);
+    cell.appendChild(lab); cell.appendChild(pad); grid.appendChild(cell);
+    pads.push(entry);
+  }});
+  var hidden = false;
+  var activePad = null;   // 直前に線を描いたマス（「一画戻す」が対象にする）
+  document.getElementById("toggleModel").addEventListener("click", function(){{
+    hidden = !hidden;
+    pads.forEach(function(p){{ p.pad.classList.toggle("hide", hidden); }});
+    this.textContent = hidden ? "お手本を表示" : "お手本を隠す";
+  }});
+  document.getElementById("undoStroke").addEventListener("click", function(){{
+    if (!activePad || !activePad.history.length) return;
+    var img = activePad.history.pop();
+    activePad.ctx.putImageData(img, 0, 0);
+  }});
+  document.getElementById("clearAll").addEventListener("click", function(){{
+    pads.forEach(function(p){{ p.ctx.clearRect(0, 0, p.cv.width, p.cv.height); p.history.length = 0; }});
+  }});
+}})();
+</script>
+"""
+
+
+def quiz_section(quiz: list[dict]) -> str:
+    """The review quiz: input per question, a collapsible answer list, and the
+    answer key as JS data for the in-page "answer check" button.
+
+    Each quiz entry is {"q": question HTML, "a": answer, "alt": [near misses],
+    "note": explanation}. Question text is left unescaped because it carries
+    <ruby> markup for the furigana toggle.
+
+    Built with %-formatting rather than an f-string: the JS below is full of
+    literal braces that an f-string would need doubled.
+    """
+    question_items, answer_items, answer_key = [], [], []
+    for i, question in enumerate(quiz):
+        question_items.append(
+            f'  <li>{question["q"]}\n'
+            f'    <div class="qline"><input class="ans" data-q="{i}" placeholder="ひらがなで入力">'
+            f'<span class="res" data-r="{i}"></span></div></li>')
+        note = question.get("note", "")
+        answer_items.append(
+            f'    <li>{esc(question["a"])}{("（" + esc(note) + "）") if note else ""}</li>')
+        alts = json.dumps(question.get("alt", []), ensure_ascii=False)
+        answer_key.append('    {ok:["%s"], alt:%s, exp:"%s"}' % (question["a"], alts, esc(note)))
+    return """
+<h2>復習クイズ(読み方をひらがなで書いてください)</h2>
+<p class="en">下の欄に入力して、「答え合わせ」ボタンを押すと、正しいか正しくないかを説明します。</p>
+<ol id="quiz">
+%s
+</ol>
+
+<p>
+  <button class="btn" id="check">答え合わせ</button>
+  <button class="btn sub2" id="reset">やり直す</button>
+  <span class="res" id="score"></span>
+</p>
+
+<details>
+  <summary>解答を表示</summary>
+  <ol>
+%s
+  </ol>
+</details>
+
+<script>
+(function(){
+  var data = [
+%s
+  ];
+  window.__quizKey = data;   // まとめ機能が採点済みの結果を送るのに使う
+  function norm(s){
+    return (s||"").trim()
+      .replace(/[ァ-ヶ]/g, function(c){return String.fromCharCode(c.charCodeAt(0)-0x60);})
+      .replace(/[\\s　・ー]/g,"");
+  }
+  document.getElementById("check").addEventListener("click", function(){
+    var n=0;
+    data.forEach(function(d,i){
+      var inp=document.querySelector('input[data-q="'+i+'"]');
+      var out=document.querySelector('span[data-r="'+i+'"]');
+      var v=norm(inp.value);
+      if(!v){ out.innerHTML='<span style="color:#666">まだ答えていません。</span>'; return; }
+      if(d.ok.indexOf(v)>=0){ n++; out.innerHTML='<span class="ok">〇 正しいです。</span> '+d.exp; }
+      else if(d.alt.indexOf(v)>=0){ out.innerHTML='<span class="ng">△ おしい！</span> 正しい答えは <b>'+d.ok[0]+'</b> です。'+d.exp; }
+      else { out.innerHTML='<span class="ng">✕ 正しくありません。</span> 正しい答えは <b>'+d.ok[0]+'</b> です。'+d.exp; }
+    });
+    document.getElementById("score").innerHTML='　<b>'+n+' ／ '+data.length+' 問正解</b>';
+  });
+  document.getElementById("reset").addEventListener("click", function(){
+    document.querySelectorAll("input.ans").forEach(function(i){i.value="";});
+    document.querySelectorAll("span.res").forEach(function(s){s.innerHTML="";});
+  });
+})();
+</script>
+""" % ("\n".join(question_items), "\n".join(answer_items), ",\n".join(answer_key))
+
+
+def level_summary(kanji: list[dict]) -> str:
+    """"N2 6字／N1 4字" — the level breakdown shown under the title.
+
+    Ordered easiest-first; any level outside N5–N1 is kept and listed last
+    rather than dropped.
+    """
+    counts: dict[str, int] = {}
+    for entry in kanji:
+        level = entry.get("level", "N3").upper()
+        counts[level] = counts.get(level, 0) + 1
+    known_order = ["N5", "N4", "N3", "N2", "N1"]
+    ordered = ([lvl for lvl in known_order if lvl in counts]
+               + [lvl for lvl in counts if lvl not in known_order])
+    return "／".join(f"{lvl} {counts[lvl]}字" for lvl in ordered)
+
+
+def build(content: dict, gifs: dict[str, str | None], content_file: str = "") -> str:
+    """Assemble the whole self-contained practice page and return it as HTML.
+
+    `gifs` maps character -> base64 GIF (or None when rendering failed).
+    `content_file` is written onto <body data-content-file> so the "まとめて"
+    button can tell the local server which content JSON today's page came from.
+    """
+    day = content.get("date") or date.today().isoformat()
+    theme = content.get("theme", "")
+    chars = "・".join(entry["char"] for entry in content["kanji"])
+
     parts = [
         "<!DOCTYPE html>", '<html lang="ja">', "<head>", '<meta charset="utf-8">',
         '<meta name="viewport" content="width=device-width, initial-scale=1">',
-        f"<title>漢字練習 {d}</title>", "<style>", CSS, "</style>", "</head>",
+        f"<title>漢字練習 {day}</title>", "<style>", CSS, "</style>", "</head>",
         f'<body data-content-file="{attr_esc(content_file)}">',
-        furigana_toggle,
+        furigana_toggle_html(),
         '<div class="page">', '<div class="wrap">', "", "<h1>漢字練習</h1>",
-        f'<p class="sub">{d}　テーマ：<b>{esc(theme)}</b>　({level_str})</p>', "",
+        f'<p class="sub">{day}　テーマ：<b>{esc(theme)}</b>　'
+        f'({level_summary(content["kanji"])})</p>', "",
         '<div class="box warm">',
         f"  <p>今日のテーマ：{esc(theme)}　／　今日の{len(content['kanji'])}字：{chars}</p>",
         '  <p class="en">まず読み方と単語を確認してから、最後の復習クイズに挑戦してください。</p>',
@@ -765,15 +867,21 @@ def build(content: dict, gifs: dict[str, str | None], out_path: str, content_fil
         '  <p class="en">※左上の「ふりがな」ボタンで、例文とクイズの読みを表示/非表示にできます。</p>',
         "</div>", "",
     ]
-    for i, k in enumerate(content["kanji"], 1):
-        parts.append(kanji_section(i, k, gifs.get(k["char"])))
+
+    for i, entry in enumerate(content["kanji"], 1):
+        parts.append(kanji_section(i, entry, gifs.get(entry["char"])))
         parts.append("")
     parts.append(practice_section(content["kanji"]))
     parts.append(quiz_section(content["quiz"]))
-    parts.append(f'<p class="foot">JLPT漢字練習 ／ {d} ／ '
+    parts.append(f'<p class="foot">JLPT漢字練習 ／ {day} ／ '
                  f'筆順データ：KanjiVG (CC BY-SA 3.0)</p>')
+
+    # gifdec.js is inlined so the page plays its GIFs on a canvas (speed
+    # control, replay, stop-at-end) instead of as a plain looping <img>.
     parts.append(PLAYER_JS % (HERE / "gifdec.js").read_text(encoding="utf-8"))
-    parts += ["</div>", chatbox, "</div>", summarize]
+
+    # The sidebar closes the .wrap/.page divs; the fixed buttons sit outside.
+    parts += ["</div>", chatbox_html(), "</div>", summarize_button_html()]
     parts.append(CHAT_JS)
     parts.append(SUMMARIZE_JS)
     parts.append(FURIGANA_JS)
@@ -781,63 +889,87 @@ def build(content: dict, gifs: dict[str, str | None], out_path: str, content_fil
     return "\n".join(parts)
 
 
+def content_json_path(out: Path) -> Path:
+    """Where to save the content JSON beside a given output page.
+
+    漢字練習_2026-08-02.html -> content_2026-08-02.json. Any other name is
+    just prefixed, so the pairing stays obvious whatever --out is given.
+    """
+    stem = (out.stem.replace("漢字練習", "content", 1) if "漢字練習" in out.stem
+            else f"content_{out.stem}")
+    return out.parent / f"{stem}.json"
+
+
+def merge_content(previous: dict, addition: dict) -> dict:
+    """Fold an extra class's content into the same day's existing content.
+
+    Kanji already present are left alone (first class wins), quiz questions are
+    appended, and themes are joined with ＋ unless the theme is already there.
+    Mutates and returns `previous`.
+    """
+    seen = {entry["char"] for entry in previous.get("kanji", [])}
+    for entry in addition["kanji"]:
+        if entry["char"] not in seen:
+            previous.setdefault("kanji", []).append(entry)
+            seen.add(entry["char"])
+    previous.setdefault("quiz", []).extend(addition.get("quiz", []))
+
+    new_theme, prev_theme = addition.get("theme", ""), previous.get("theme", "")
+    if new_theme and new_theme not in prev_theme.split("＋"):
+        previous["theme"] = f"{prev_theme}＋{new_theme}" if prev_theme else new_theme
+    return previous
+
+
 def main() -> int:
-    p = argparse.ArgumentParser(description="漢字練習HTMLを組み立てる")
-    p.add_argument("content", type=Path, help="内容を書いたJSONファイル")
-    p.add_argument("--out", type=Path, help="出力HTML（既定：~/Documents/Claude-JP/漢字/漢字練習_<date>.html）")
-    p.add_argument("--gifdir", type=Path, default=Path.home() / "Documents" / "Claude-JP" / "漢字" / "gif")
-    p.add_argument("--maker", type=Path, default=DEFAULT_MAKER, help="kanji_gif.py のパス")
-    p.add_argument("--size", type=int, default=240, help="GIFの大きさ（px）")
-    p.add_argument("--skip-gif", action="store_true", help="GIFを作らない（テスト用）")
-    p.add_argument("--conda-env", default="kanji", help="kanji_gif.py を実行するconda環境名")
-    p.add_argument("--kind", choices=["daily", "extra", "review"], default="daily",
-                   help="daily=通常の1回、extra=同じ日の追加クラス（既存ファイルに合流する）、review=金曜の週次復習")
-    p.add_argument("--history", type=Path, default=DEFAULT_HISTORY, help="履歴JSONのパス")
-    p.add_argument("--content-out", type=Path, help="コンテンツJSONの保存先（既定：out横のcontent_<date>.json）")
-    p.add_argument("--append", action="store_true",
-                   help="同じ日付のcontent_<date>.jsonが既にあれば、上書きせずそこに合流させる"
-                        "（同じ日の追加クラス用。ファイルがなければ通常通り新規作成）")
-    a = p.parse_args()
+    parser = argparse.ArgumentParser(description="漢字練習HTMLを組み立てる")
+    parser.add_argument("content", type=Path, help="内容を書いたJSONファイル")
+    parser.add_argument("--out", type=Path,
+                        help="出力HTML（既定：~/Documents/Claude-JP/漢字/漢字練習_<date>.html）")
+    parser.add_argument("--gifdir", type=Path,
+                        default=Path.home() / "Documents" / "Claude-JP" / "漢字" / "gif")
+    parser.add_argument("--maker", type=Path, default=DEFAULT_MAKER, help="kanji_gif.py のパス")
+    parser.add_argument("--size", type=int, default=240, help="GIFの大きさ（px）")
+    parser.add_argument("--skip-gif", action="store_true", help="GIFを作らない（テスト用）")
+    parser.add_argument("--conda-env", default="kanji", help="kanji_gif.py を実行するconda環境名")
+    parser.add_argument("--kind", choices=["daily", "extra", "review"], default="daily",
+                        help="daily=通常の1回、extra=同じ日の追加クラス（既存ファイルに合流する）、"
+                             "review=金曜の週次復習")
+    parser.add_argument("--history", type=Path, default=DEFAULT_HISTORY, help="履歴JSONのパス")
+    parser.add_argument("--content-out", type=Path,
+                        help="コンテンツJSONの保存先（既定：out横のcontent_<date>.json）")
+    parser.add_argument("--append", action="store_true",
+                        help="同じ日付のcontent_<date>.jsonが既にあれば、上書きせずそこに合流させる"
+                             "（同じ日の追加クラス用。ファイルがなければ通常通り新規作成）")
+    args = parser.parse_args()
 
-    content = json.loads(a.content.read_text(encoding="utf-8"))
-    d = content.get("date") or date.today().isoformat()
-    out = a.out or (Path.home() / "Documents" / "Claude-JP" / "漢字" / f"漢字練習_{d}.html")
-    stem = out.stem.replace("漢字練習", "content", 1) if "漢字練習" in out.stem else f"content_{out.stem}"
-    content_out = a.content_out or (out.parent / f"{stem}.json")
+    content = json.loads(args.content.read_text(encoding="utf-8"))
+    day = content.get("date") or date.today().isoformat()
+    out = args.out or (Path.home() / "Documents" / "Claude-JP" / "漢字" / f"漢字練習_{day}.html")
+    content_out = args.content_out or content_json_path(out)
 
-    if a.append and content_out.exists():
-        prev = json.loads(content_out.read_text(encoding="utf-8"))
-        seen = {k["char"] for k in prev.get("kanji", [])}
-        for k in content["kanji"]:
-            if k["char"] not in seen:
-                prev.setdefault("kanji", []).append(k)
-                seen.add(k["char"])
-        prev.setdefault("quiz", []).extend(content.get("quiz", []))
-        new_theme, prev_theme = content.get("theme", ""), prev.get("theme", "")
-        if new_theme and new_theme not in prev_theme.split("＋"):
-            prev["theme"] = f"{prev_theme}＋{new_theme}" if prev_theme else new_theme
-        content = prev
-        print(f"  合流先: {content_out}（既存 {len(seen)} 字に合流）")
+    # An extra class on a day that already has a page merges into it rather
+    # than overwriting, so the day ends up with one combined page.
+    if args.append and content_out.exists():
+        content = merge_content(json.loads(content_out.read_text(encoding="utf-8")), content)
+        merged_chars = {entry["char"] for entry in content["kanji"]}
+        print(f"  合流先: {content_out}（既存 {len(merged_chars)} 字に合流）")
 
     gifs: dict[str, str | None] = {}
     failed: list[str] = []
-    if not a.skip_gif:
-        for k in content["kanji"]:
-            print(f"  … {k['char']} のGIFを作成中")
-            gifs[k["char"]] = make_gif(k["char"], a.gifdir, a.maker, a.size, a.conda_env)
-            if not gifs[k["char"]]:
-                failed.append(k["char"])
+    if not args.skip_gif:
+        gifs, failed = make_gifs(content["kanji"], args.gifdir, args.maker,
+                                 args.size, args.conda_env)
 
     out.parent.mkdir(parents=True, exist_ok=True)
     content_out.write_text(json.dumps(content, ensure_ascii=False, indent=2), encoding="utf-8")
-    out.write_text(build(content, gifs, str(out), str(content_out)), encoding="utf-8")
+    out.write_text(build(content, gifs, str(content_out)), encoding="utf-8")
 
-    hist = load_history(a.history)
-    dupes = update_history(hist, content, a.kind, d, str(content_out))
-    save_history(a.history, hist)
+    history = load_history(args.history)
+    dupes = update_history(history, content, args.kind, day, str(content_out))
+    save_history(args.history, history)
 
-    ok = sum(1 for v in gifs.values() if v)
-    print(f"完了：{out}（GIF {ok}/{len(content['kanji'])}）")
+    made = sum(1 for gif in gifs.values() if gif)
+    print(f"完了：{out}（GIF {made}/{len(content['kanji'])}）")
     if dupes:
         print(f"警告: 履歴上すでに使用済みの字が含まれています — {'・'.join(dupes)}", file=sys.stderr)
         print("   選定時にkanji_history.jsonを確認し損ねた可能性があります。", file=sys.stderr)
