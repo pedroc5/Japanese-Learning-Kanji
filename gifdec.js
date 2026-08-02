@@ -1,82 +1,143 @@
 // 最小限のGIFデコーダ（GIF87a/89a、LZW、透明色、廃棄方法に対応）
+//
+// 使い方: composeFrames(decodeGIF(bytes)) で、各コマが「画面全体のRGBA」に
+// なった配列が返る。漢字練習ページはこれをcanvasに描いて、速さ調整・もう一度・
+// 最後で停止ができるようにしている（<img>のままでは制御できないため）。
+
+// GIFのLZW圧縮を展開して、パレット番号の並び（1ピクセル1バイト）を返す。
+// 辞書は「親コード＋1バイト」の連結リストで持つ: あるコードの並びは、
+// suffixOf[code] を集めながら prefixOf[code] を根までたどると逆順で得られる。
 function lzwDecode(minCodeSize, data, pixelCount) {
   var out = new Uint8Array(pixelCount);
-  var clear = 1 << minCodeSize, eoi = clear + 1;
+  var clearCode = 1 << minCodeSize, endCode = clearCode + 1;
   var codeSize = minCodeSize + 1, mask = (1 << codeSize) - 1;
-  var dictP = [], dictS = [];
-  function reset() {
-    dictP.length = 0; dictS.length = 0;
-    for (var i = 0; i < clear; i++) { dictP.push(-1); dictS.push(i); }
-    dictP.push(-1); dictS.push(0);   // clear
-    dictP.push(-1); dictS.push(0);   // eoi
+  var prefixOf = [], suffixOf = [];
+
+  // 辞書を初期状態（1バイトずつの並び＋制御コード2つ）に戻す
+  function resetDict() {
+    prefixOf.length = 0; suffixOf.length = 0;
+    for (var i = 0; i < clearCode; i++) { prefixOf.push(-1); suffixOf.push(i); }
+    prefixOf.push(-1); suffixOf.push(0);   // clearCode の分
+    prefixOf.push(-1); suffixOf.push(0);   // endCode の分
     codeSize = minCodeSize + 1; mask = (1 << codeSize) - 1;
   }
-  reset();
-  var bit = 0, pos = 0, prev = -1, stack = [];
+
+  // そのコードが表す並びの「最初の1バイト」（根までたどる）
+  function firstByteOf(code) {
+    while (prefixOf[code] >= 0) code = prefixOf[code];
+    return suffixOf[code];
+  }
+
+  resetDict();
+  var bit = 0, pos = 0, prevCode = -1, pending = [];
   while (pos < pixelCount) {
+    // コードはバイト境界をまたぐので、3バイト読んでからビット位置で切り出す
     var byteIdx = bit >> 3;
     if (byteIdx >= data.length) break;
-    var v = data[byteIdx] | (data[byteIdx + 1] << 8) | (data[byteIdx + 2] << 16);
-    var code = (v >> (bit & 7)) & mask;
+    var window = data[byteIdx] | (data[byteIdx + 1] << 8) | (data[byteIdx + 2] << 16);
+    var code = (window >> (bit & 7)) & mask;
     bit += codeSize;
-    if (code === clear) { reset(); prev = -1; continue; }
-    if (code === eoi) break;
-    var cur = code;
-    if (code >= dictP.length) { cur = prev; stack.push(firstOf(prev)); }
-    // コードを展開
+
+    if (code === clearCode) { resetDict(); prevCode = -1; continue; }
+    if (code === endCode) break;
+
+    // 未登録のコード（いわゆるKwKwKの場合）は、直前の並び＋その先頭バイトになる
+    var current = code;
+    if (code >= prefixOf.length) { current = prevCode; pending.push(firstByteOf(prevCode)); }
+
+    // 連結リストを逆順にたどってから、正順で書き出す
     var chain = [];
-    var c = cur;
-    while (c >= 0) { chain.push(dictS[c]); c = dictP[c]; }
+    var node = current;
+    while (node >= 0) { chain.push(suffixOf[node]); node = prefixOf[node]; }
     for (var i = chain.length - 1; i >= 0; i--) {
       if (pos < pixelCount) out[pos++] = chain[i];
     }
-    while (stack.length) { if (pos < pixelCount) out[pos++] = stack.pop(); }
-    if (prev >= 0 && dictP.length < 4096) {
-      dictP.push(prev); dictS.push(chain[chain.length - 1]);
-      if (dictP.length === (1 << codeSize) && codeSize < 12) {
-        codeSize++; mask = (1 << codeSize) - 1;
+    while (pending.length) { if (pos < pixelCount) out[pos++] = pending.pop(); }
+
+    // 「直前の並び＋今回の先頭バイト」を新しいコードとして登録する
+    if (prevCode >= 0 && prefixOf.length < 4096) {
+      prefixOf.push(prevCode); suffixOf.push(chain[chain.length - 1]);
+      if (prefixOf.length === (1 << codeSize) && codeSize < 12) {
+        codeSize++; mask = (1 << codeSize) - 1;   // 辞書が埋まったらコード長を伸ばす
       }
     }
-    prev = code < dictP.length ? code : dictP.length - 1;
+    prevCode = code < prefixOf.length ? code : prefixOf.length - 1;
   }
-  function firstOf(c) { while (dictP[c] >= 0) c = dictP[c]; return dictS[c]; }
   return out;
 }
 
+// GIFのバイト列を読んで、{width, height, frames} を返す。
+// frames の各要素はまだ「差分の小さな矩形」のままなので、画面全体の絵にするには
+// composeFrames() を通すこと。
 function decodeGIF(buf) {
-  var p = 6;
-  function r8() { return buf[p++]; }
-  function r16() { var v = buf[p] | (buf[p + 1] << 8); p += 2; return v; }
-  var W = r16(), H = r16(), pk = r8(); p += 2;
-  var gct = null;
-  if (pk & 0x80) { var n = 2 << (pk & 7); gct = buf.subarray(p, p + n * 3); p += n * 3; }
-  var frames = [], delay = 10, disposal = 0, transp = -1;
-  while (p < buf.length) {
-    var b = r8();
-    if (b === 0x21) {
-      var label = r8();
-      if (label === 0xF9) {
-        r8(); var f = r8(); delay = r16(); var ti = r8(); r8();
-        disposal = (f >> 2) & 7; transp = (f & 1) ? ti : -1;
-      } else { var s; while ((s = r8())) p += s; }
-    } else if (b === 0x2C) {
-      var x = r16(), y = r16(), w = r16(), h = r16(), ipk = r8(), lct = null;
-      if (ipk & 0x80) { var m = 2 << (ipk & 7); lct = buf.subarray(p, p + m * 3); p += m * 3; }
-      var interlace = !!(ipk & 0x40);
-      var minCode = r8(), parts = [], total = 0, sz;
-      while ((sz = r8())) { parts.push(buf.subarray(p, p + sz)); total += sz; p += sz; }
-      var data = new Uint8Array(total + 3), o = 0;
-      parts.forEach(function (a) { data.set(a, o); o += a.length; });
-      var px = lzwDecode(minCode, data, w * h);
-      if (interlace) px = deinterlace(px, w, h);
-      frames.push({ x: x, y: y, w: w, h: h, px: px, pal: lct || gct,
-                    transp: transp, delay: delay * 10, disposal: disposal });
-      delay = 10; disposal = 0; transp = -1;
-    } else break;
+  var pos = 6;                                  // "GIF89a" の6バイトを読み飛ばす
+  function readByte() { return buf[pos++]; }
+  function readShort() { var v = buf[pos] | (buf[pos + 1] << 8); pos += 2; return v; }
+
+  var width = readShort(), height = readShort(), flags = readByte();
+  pos += 2;                                     // 背景色番号とアスペクト比（未使用）
+
+  var globalPalette = null;
+  if (flags & 0x80) {                           // 全体パレットあり
+    var globalSize = 2 << (flags & 7);
+    globalPalette = buf.subarray(pos, pos + globalSize * 3);
+    pos += globalSize * 3;
   }
-  return { width: W, height: H, frames: frames };
+
+  // 次のコマに適用する設定。グラフィック制御拡張を読むたびに更新される。
+  var frames = [], delay = 10, disposal = 0, transparent = -1;
+  while (pos < buf.length) {
+    var block = readByte();
+
+    if (block === 0x21) {                       // 拡張ブロック
+      var label = readByte();
+      if (label === 0xF9) {                     // グラフィック制御拡張
+        readByte();                             // ブロックサイズ（常に4）
+        var packed = readByte();
+        delay = readShort();
+        var transparentIndex = readByte();
+        readByte();                             // ブロック終端
+        disposal = (packed >> 2) & 7;
+        transparent = (packed & 1) ? transparentIndex : -1;
+      } else {                                  // それ以外（コメント等）は読み飛ばす
+        var skip;
+        while ((skip = readByte())) pos += skip;
+      }
+
+    } else if (block === 0x2C) {                // 画像ブロック
+      var x = readShort(), y = readShort(), w = readShort(), h = readShort();
+      var imageFlags = readByte(), localPalette = null;
+      if (imageFlags & 0x80) {                  // このコマ専用のパレット
+        var localSize = 2 << (imageFlags & 7);
+        localPalette = buf.subarray(pos, pos + localSize * 3);
+        pos += localSize * 3;
+      }
+      var interlaced = !!(imageFlags & 0x40);
+
+      // 画素データは細切れのサブブロックで届くので、ひと続きに繋ぎ直す。
+      // 末尾の+3は、lzwDecodeが常に3バイト先読みするための余白。
+      var minCodeSize = readByte(), chunks = [], total = 0, chunkSize;
+      while ((chunkSize = readByte())) {
+        chunks.push(buf.subarray(pos, pos + chunkSize));
+        total += chunkSize;
+        pos += chunkSize;
+      }
+      var data = new Uint8Array(total + 3), offset = 0;
+      chunks.forEach(function (chunk) { data.set(chunk, offset); offset += chunk.length; });
+
+      var pixels = lzwDecode(minCodeSize, data, w * h);
+      if (interlaced) pixels = deinterlace(pixels, w, h);
+      frames.push({ x: x, y: y, w: w, h: h, px: pixels,
+                    pal: localPalette || globalPalette,
+                    transp: transparent, delay: delay * 10, disposal: disposal });
+
+      delay = 10; disposal = 0; transparent = -1;   // 次のコマ用に初期化
+    } else break;                                   // 終端（0x3B）や壊れたデータ
+  }
+  return { width: width, height: height, frames: frames };
 }
 
+// インターレースGIFの行順（1/8, 1/8ずれ, 1/4, 1/2）を通常の並びに戻す
 function deinterlace(px, w, h) {
   var out = new Uint8Array(px.length), rows = [], y;
   for (y = 0; y < h; y += 8) rows.push(y);
@@ -87,37 +148,42 @@ function deinterlace(px, w, h) {
   return out;
 }
 
-// 各コマを「画面全体のRGBA」に合成する
+// 各コマを「画面全体のRGBA」に合成する。
+// GIFのコマは前のコマとの差分なので、1枚のcanvasに順番に重ね、その都度コピーを取る。
 function composeFrames(gif) {
-  var W = gif.width, H = gif.height;
-  var canvas = new Uint8ClampedArray(W * H * 4);
+  var width = gif.width, height = gif.height;
+  var canvas = new Uint8ClampedArray(width * height * 4);
   var out = [];
+
   for (var i = 0; i < gif.frames.length; i++) {
-    var f = gif.frames[i];
-    var before = f.disposal === 3 ? canvas.slice(0) : null;
-    for (var yy = 0; yy < f.h; yy++) {
-      for (var xx = 0; xx < f.w; xx++) {
-        var ci = f.px[yy * f.w + xx];
-        if (ci === f.transp) continue;
-        var di = ((f.y + yy) * W + (f.x + xx)) * 4;
-        if (di < 0 || di + 3 >= canvas.length) continue;
-        canvas[di] = f.pal[ci * 3];
-        canvas[di + 1] = f.pal[ci * 3 + 1];
-        canvas[di + 2] = f.pal[ci * 3 + 2];
-        canvas[di + 3] = 255;
+    var frame = gif.frames[i];
+    // 廃棄方法3＝「前の状態に戻す」なので、上書きする前に控えておく
+    var restorePoint = frame.disposal === 3 ? canvas.slice(0) : null;
+
+    for (var yy = 0; yy < frame.h; yy++) {
+      for (var xx = 0; xx < frame.w; xx++) {
+        var colorIndex = frame.px[yy * frame.w + xx];
+        if (colorIndex === frame.transp) continue;      // 透明画素は下の絵を残す
+        var at = ((frame.y + yy) * width + (frame.x + xx)) * 4;
+        if (at < 0 || at + 3 >= canvas.length) continue;
+        canvas[at] = frame.pal[colorIndex * 3];
+        canvas[at + 1] = frame.pal[colorIndex * 3 + 1];
+        canvas[at + 2] = frame.pal[colorIndex * 3 + 2];
+        canvas[at + 3] = 255;
       }
     }
-    out.push({ data: canvas.slice(0), delay: f.delay || 100 });
-    if (f.disposal === 2) {
-      for (var yy2 = 0; yy2 < f.h; yy2++) {
-        for (var xx2 = 0; xx2 < f.w; xx2++) {
-          var d2 = ((f.y + yy2) * W + (f.x + xx2)) * 4;
-          canvas[d2] = canvas[d2 + 1] = canvas[d2 + 2] = canvas[d2 + 3] = 0;
+    out.push({ data: canvas.slice(0), delay: frame.delay || 100 });
+
+    if (frame.disposal === 2) {                          // 2＝この領域を消す
+      for (var cy = 0; cy < frame.h; cy++) {
+        for (var cx = 0; cx < frame.w; cx++) {
+          var clearAt = ((frame.y + cy) * width + (frame.x + cx)) * 4;
+          canvas[clearAt] = canvas[clearAt + 1] = canvas[clearAt + 2] = canvas[clearAt + 3] = 0;
         }
       }
-    } else if (f.disposal === 3 && before) { canvas = before; }
+    } else if (frame.disposal === 3 && restorePoint) { canvas = restorePoint; }
   }
-  return { width: W, height: H, frames: out };
+  return { width: width, height: height, frames: out };
 }
 
 if (typeof module !== "undefined") module.exports = { decodeGIF: decodeGIF, composeFrames: composeFrames };
