@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:jlptsensei.com)",
+      "Bash(conda run -n kanji python /Users/pedrocoutinho/.claude/skills/kanji-practice/build_page.py *)",
+      "Bash(conda run -n kanji python /Users/pedrocoutinho/.claude/skills/kanji-practice/build_review.py *)",
+      "Edit(/tmp/kanji_content.json)",
+      "Edit(/Users/pedrocoutinho/Documents/Claude-JP/**)",
+      "Read(/Users/pedrocoutinho/Documents/Claude-JP/**)"
+    ]
+  }
+}

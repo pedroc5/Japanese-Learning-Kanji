@@ -16,7 +16,10 @@ done
 
 {
   echo "===== $(date '+%Y-%m-%d %H:%M:%S') ====="
-  cd "$HOME/Documents/Claude-JP" || exit 1
+  # スキルフォルダ自体をカレントディレクトリにする。ここに .claude/settings.json があるので
+  # 自動実行に必要な権限（WebFetch/Bash/Edit）がこのディレクトリ基準で読み込まれる。
+  # 出力先(~/Documents/Claude-JP/漢字/)は変わらず絶対パスのまま。
+  cd "$HOME/.claude/skills/kanji-practice" || exit 1
   claude -p "/kanji-practice" --permission-mode acceptEdits
   echo "exit: $?"
 

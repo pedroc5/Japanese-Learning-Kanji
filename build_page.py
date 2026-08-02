@@ -22,7 +22,8 @@ from datetime import date
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-DEFAULT_MAKER = Path.home() / "Documents" / "Kanji-gif-creator" / "kanji_gif.py"
+DEFAULT_MAKER = HERE / "kanji_gif.py"
+DEFAULT_SVG_CACHE = HERE / ".kanjivg_cache"
 KVG_RAW = "https://raw.githubusercontent.com/KanjiVG/kanjivg/master/kanji/{cp}.svg"
 DEFAULT_HISTORY = Path.home() / "Documents" / "Claude-JP" / "漢字" / "kanji_history.json"
 
@@ -248,7 +249,8 @@ def make_gif(char: str, gifdir: Path, maker: Path, size: int, conda_env: str) ->
     if not out.exists():
         gifdir.mkdir(parents=True, exist_ok=True)
         cmd = ["conda", "run", "-n", conda_env, "python", str(maker), KVG_RAW.format(cp=cp),
-               "--outdir", str(gifdir), "--size", str(size), "--grid"]
+               "--outdir", str(gifdir), "--size", str(size), "--grid",
+               "--cache-dir", str(DEFAULT_SVG_CACHE)]
         try:
             subprocess.run(cmd, check=True, capture_output=True, timeout=300)
         except subprocess.CalledProcessError as e:

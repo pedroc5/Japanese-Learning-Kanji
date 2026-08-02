@@ -164,16 +164,23 @@ Pedroにそのまま黙って進めず、次回から気をつける（同じ字
 ## 注意
 
 - 筆順データはKanjiVG（CC BY-SA 3.0）。出典表記はページのフッターに入る。
-- `kanji_gif.py` は `~/Documents/Kanji-gif-creator/` にある。場所が違うときは `--maker <path>`。
+- `kanji_gif.py`はこのスキルフォルダ自身にある（`~/.claude/skills/kanji-practice/kanji_gif.py`）。
+  場所が違うときは `--maker <path>`。SVGのダウンロードキャッシュも
+  `~/.claude/skills/kanji-practice/.kanjivg_cache/` に置く（`--cache-dir`で変更可）。
 - `svgpathtools`, `Pillow`, `requests` が必要（conda環境 `kanji` に入っている）。
 - 平日（月〜金）10:00に launchd（`com.pedro.kanji-daily`）が自動実行する。Pedroが日中に追加のクラスを
   頼んできたときは、上記の `--kind extra --append` の手順でその日のページに合流させればよい
   （自動実行や翌日以降のスケジュールを妨げない）。
-- 自動実行は `claude -p "/kanji-practice" --permission-mode acceptEdits`（`run_daily.sh`）で行われ、
-  jlptsensei.comへのWebFetchや`build_page.py`/`build_review.py`の実行、`~/Documents/Claude-JP/`配下への
-  書き込みは `~/Documents/Claude-JP/.claude/settings.json` で事前許可済み。
+- 自動実行は `claude -p "/kanji-practice" --permission-mode acceptEdits`（`run_daily.sh`）で行われる。
+  カレントディレクトリはこのスキルフォルダ自身（`~/.claude/skills/kanji-practice/`）にしてあり、
+  そこにある `.claude/settings.json` で、jlptsensei.comへのWebFetchや`build_page.py`/`build_review.py`
+  の実行、`~/Documents/Claude-JP/`配下への書き込みが事前許可されている
+  （出力先自体は変わらず `~/Documents/Claude-JP/漢字/` のまま）。
 - ページ内のチャット・まとめ機能は `ask_server.py`（`com.pedro.kanji-ask-server`、launchdで常駐、
   `127.0.0.1:8765`）が動いていないと使えない。`launchctl list | grep kanji-ask-server` で起動確認、
   ログは `~/Documents/Claude-JP/漢字/ask_server.log`。サーバー内部の`claude -p`呼び出しも
-  同じ`~/Documents/Claude-JP/.claude/settings.json`の許可を使うため、質問の内容によっては
+  同じスキルフォルダの`.claude/settings.json`の許可を使うため、質問の内容によっては
   （未許可のツールを使おうとした場合など）応答がタイムアウトすることがある。
+- インタラクティブに`claude`を起動して手動でこのスキルを試すときも、同じ権限を自動適用させたいなら
+  `~/Documents/Claude-JP`ではなく`~/.claude/skills/kanji-practice`から起動するとよい
+  （`.claude/settings.json`はカレントディレクトリ基準で読み込まれるため）。

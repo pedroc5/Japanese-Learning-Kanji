@@ -22,7 +22,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-CWD = Path.home() / "Documents" / "Claude-JP"
+CWD = Path(__file__).resolve().parent  # スキルフォルダ。.claude/settings.json の権限がここ基準で読み込まれる
 TIMEOUT = 180
 SUMMARY_TIMEOUT = 240
 
