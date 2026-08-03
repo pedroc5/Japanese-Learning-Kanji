@@ -22,12 +22,22 @@ cp -R kanji-practice ~/.claude/skills/kanji-practice
 ```
 
 The folder holds `SKILL.md` (the routine), `build_page.py`/`build_review.py`
-(page builders), `ask_server.py` (the local chat/summary server),
-`kanji_gif.py` (stroke-order GIF maker), `gifdec.js` (GIF player embedded in
-the page), and `.claude/settings.json` (pre-approved permissions for
-unattended runs).
+(page builders), `test_build_page.py` (their smoke tests), `ask_server.py`
+(the local chat/summary server), `kanji_gif.py` (a standalone stroke-order GIF
+maker, no longer used by the pages), and `.claude/settings.json` (pre-approved
+permissions for unattended runs).
 
 ## 3. Check the environment
+
+The page builders need only the standard library — they draw the stroke order
+as inline SVG straight from KanjiVG, so no conda environment is involved:
+
+```bash
+python3 ~/.claude/skills/kanji-practice/test_build_page.py
+```
+
+If that reports `OK`, the builders work. `kanji_gif.py` is a separate tool and
+is the only thing that still wants the `kanji` environment:
 
 ```bash
 conda run -n kanji python -c "import svgpathtools, PIL, requests; print('ok')"
@@ -35,8 +45,6 @@ conda run -n kanji python ~/.claude/skills/kanji-practice/kanji_gif.py \
   https://raw.githubusercontent.com/KanjiVG/kanjivg/master/kanji/06cca.svg \
   --outdir /tmp/gt --size 240 --grid && open /tmp/gt/06cca.gif
 ```
-
-If a GIF opens showing 泊 being written stroke by stroke, the pipeline works.
 
 ## 4. Try it once by hand
 
@@ -81,8 +89,8 @@ launchctl unload ~/Library/LaunchAgents/com.pedro.kanji-daily.plist
 
 ## 6. Start the chat/summary server
 
-The page's chat sidebar, "まとめて" summary button, and furigana toggle need a
-small local server running in the background:
+The page's chat sidebar and "まとめて" summary button need a small local server
+running in the background:
 
 ```bash
 chmod +x ~/.claude/skills/kanji-practice/run_ask_server.sh
@@ -94,16 +102,21 @@ It starts at login and restarts itself if it crashes (`KeepAlive`), listening
 on `http://127.0.0.1:8765`. Logs: `~/Documents/Claude-JP/漢字/ask_server.log`.
 Check it's up with `launchctl list | grep kanji-ask-server`.
 
+After changing `ask_server.py`, reload it — the running copy keeps the old code:
+
+```bash
+launchctl kickstart -k gui/$(id -u)/com.pedro.kanji-ask-server
+```
+
 ## Notes
 
 - The first scheduled run may fail on permissions if `.claude/settings.json`
   doesn't yet cover something a question happens to need — check
   `~/Documents/Claude-JP/漢字/build.log` / `ask_server.log`.
-- `run_daily.sh`/`run_ask_server.sh` look for conda at `/opt/miniconda3` first,
-  then `~/miniconda3`, `~/anaconda3`, `~/miniforge3`. Edit the path if yours
-  differs.
-- Old GIFs are cached in `~/Documents/Claude-JP/漢字/gif/`; raw KanjiVG SVGs
-  are cached in `~/.claude/skills/kanji-practice/.kanjivg_cache/`. Repeated
-  kanji cost nothing.
+- Neither `run_daily.sh` nor `run_ask_server.sh` needs conda any more — the
+  builders and the server are standard library only. `kanji_gif.py` is the one
+  remaining thing that wants the `kanji` environment.
+- Raw KanjiVG SVGs are cached in
+  `~/.claude/skills/kanji-practice/.kanjivg_cache/`. Repeated kanji cost nothing.
 - Once this is running, you can delete any other scheduled task doing the
   same thing so you don't get two pages a day.

@@ -13,17 +13,16 @@ See SKILL.md for the JSON schema.
 from __future__ import annotations
 
 import argparse
-import base64
 import html
 import json
 import re
-import subprocess
 import sys
+import urllib.request
+import xml.etree.ElementTree as ET
 from datetime import date
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-DEFAULT_MAKER = HERE / "kanji_gif.py"
 DEFAULT_SVG_CACHE = HERE / ".kanjivg_cache"
 KVG_RAW = "https://raw.githubusercontent.com/KanjiVG/kanjivg/master/kanji/{cp}.svg"
 DEFAULT_HISTORY = Path.home() / "Documents" / "Claude-JP" / "漢字" / "kanji_history.json"
@@ -39,9 +38,8 @@ QUIZ_RESULTS_DIR = HERE / ".quiz_results"
 # --------------------------------------------------------------------------- #
 # Embedded page assets
 #
-# Everything below is copied verbatim into the generated HTML. Only PLAYER_JS
-# is templated (its %s takes the gifdec.js source). Edit with care: the pages
-# are self-contained, so a browser only ever sees this copy.
+# Everything below is copied verbatim into the generated HTML. Edit with care:
+# the pages are self-contained, so a browser only ever sees this copy.
 # --------------------------------------------------------------------------- #
 
 
@@ -142,8 +140,22 @@ CSS = """
   .anim .cap b{color:var(--navy)}
   .player{position:relative; width:170px; height:170px; border:2px solid var(--navy);
           border-radius:6px; background:#fff; overflow:hidden}
-  .player canvas{display:block; width:170px; height:170px}
   .player .wait{font-size:13px; color:var(--grey); text-align:center; padding-top:72px}
+  /* 筆順のSVG。JSが無くても完成した字がそのまま見える（下の html.js が効かないため）。
+     JSがあるときは各画をいったん隠して、順番に引いて見せる。 */
+  .strokes{display:block; width:170px; height:170px}
+  .strokes .grid line{stroke:#f3d3d3; stroke-width:.6; stroke-dasharray:4 3}
+  .strokes .grid rect{fill:none; stroke:#f3d3d3; stroke-width:.8}
+  .strokes .ghost path{fill:none; stroke:#ececec; stroke-linecap:round; stroke-linejoin:round}
+  .strokes .ink path{fill:none; stroke-linecap:round; stroke-linejoin:round}
+  .strokes .nums text{font-size:6px; fill:#555; font-family:"Helvetica Neue",Arial,sans-serif}
+  /* pathLength="1" なので「1」は画の全長。ギャップを2にするのは、dasharrayが
+     周期的に繰り返されるため：ギャップが1だと周期2でちょうど画の終点で模様が
+     一巡し、長さ0の破線が round のキャップで「点」として描かれてしまう
+     （まだ引いていない画の端に色の点が残る）。ギャップを画より長くすれば
+     繰り返しは画の中に入ってこない。 */
+  html.js .strokes .ink path{stroke-dasharray:1 2; stroke-dashoffset:1}
+  html.js .strokes .nums text{opacity:0}
   .ctl{display:inline-flex; align-items:center; gap:8px; flex-wrap:wrap; margin-top:6px}
   .ctl input[type=range]{width:130px; vertical-align:middle}
   .ctl label{font-size:13px; color:var(--grey)}
@@ -153,6 +165,9 @@ CSS = """
   .grid{display:flex; flex-wrap:wrap; gap:14px; margin-top:12px}
   .cell{position:relative; width:112px}
   .cell .label{font-size:13px; color:var(--grey); text-align:center; margin-bottom:2px}
+  .cell .padres{font-size:11px; line-height:1.4; text-align:center; margin-top:3px; min-height:15px}
+  .cell .padres.ok{color:var(--green)}
+  .cell .padres.ng{color:var(--accent)}
   .pad{position:relative; width:112px; height:112px; border:2px solid var(--navy);
        border-radius:4px; background:#fff;
        background-image:
@@ -234,46 +249,59 @@ CSS = """
 """
 
 
-PLAYER_JS = """
+STROKE_JS = """
 <script>
-/* 筆順GIFを解析して canvas で再生する（速さ調整・もう一度・最後で停止）。
-   GIF本体は本文ではなくページ末尾の <script id="gif-data"> に字ごとにまとめてあり
-   （本文のHTMLを人が読めるようにするため）、ここで字を鍵に取り出して復号する。
-   1字ずつ setTimeout に分けるのは、10字を一度に復号してページを固まらせないため。 */
-%s
+/* 筆順アニメーション：SVGの各画を stroke-dashoffset で引いて見せる。
+
+   画の描き終わりからではなく、パスの弧長そのものに沿って進むので、曲線の
+   パラメータ化が不揃いでも筆の速さは一定になる（ブラウザの dash 計算が弧長
+   基準であるため、こちらで長さ表を作る必要がない）。
+   各パスには pathLength="1" が付けてあるので、dashoffset は
+   「まだ引いていない割合」そのものとして 1→0 で扱える。 */
 (function(){
-  var holder = document.getElementById("gif-data");
-  if (!holder) return;
-  var data;
-  try { data = JSON.parse(holder.textContent); } catch (e) { return; }
+  var SPEED = 130;     // ×1のときの筆の速さ（viewBoxの単位／秒）
+  var PAUSE = 110;     // 画と画のあいだの間（ミリ秒）
+  var still = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
-  function toBytes(b64){
-    var bin = atob(b64), out = new Uint8Array(bin.length);
-    for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-    return out;
-  }
+  document.querySelectorAll(".strokes").forEach(function(svg){
+    var inks = Array.prototype.slice.call(svg.querySelectorAll(".ink path"));
+    var nums = Array.prototype.slice.call(svg.querySelectorAll(".nums text"));
+    if (!inks.length) return;
 
-  function mount(box, b64){
-    var g = composeFrames(decodeGIF(toBytes(b64)));
-    if (!g.frames.length) return;
-    var cv = document.createElement("canvas");
-    cv.width = g.width; cv.height = g.height;
-    box.innerHTML = ""; box.appendChild(cv);
-    var ctx = cv.getContext("2d");
-    var frames = g.frames.map(function(f){
-      var im = ctx.createImageData(g.width, g.height);
-      im.data.set(f.data); im.delay = f.delay; return im;
-    });
-    var speed = 1, timer = null, idx = 0;
-    function draw(){
-      ctx.putImageData(frames[idx], 0, 0);
-      if (idx >= frames.length - 1) return;      // 最後で停止
-      timer = setTimeout(function(){ idx++; draw(); },
-                         Math.max(20, frames[idx].delay / speed));
+    function show(i, frac){
+      inks[i].style.strokeDashoffset = String(1 - frac);
+      if (nums[i]) nums[i].style.opacity = frac > 0 ? "1" : "0";
     }
-    function start(){ clearTimeout(timer); idx = 0; draw(); }
-    start();
-    var cap = box.parentNode;
+    function finish(){ inks.forEach(function(_, i){ show(i, 1); }); }
+
+    if (still) { finish(); return; }     // 動きを減らす設定なら完成形のまま
+
+    var lens = inks.map(function(p){
+      try { return p.getTotalLength() || 1; } catch (e) { return 40; }
+    });
+    var speed = 1, raf = null, vt = 0, last = 0;
+
+    function frame(now){
+      vt += (now - last) * speed;        // 速さを変えても飛ばずに続くよう、経過を積む
+      last = now;
+      var acc = 0, running = false;
+      for (var i = 0; i < inks.length; i++) {
+        var dur = lens[i] / SPEED * 1000;
+        var local = vt - acc;
+        var frac = local <= 0 ? 0 : (local >= dur ? 1 : local / dur);
+        show(i, frac);
+        if (frac < 1) running = true;
+        acc += dur + PAUSE;
+      }
+      raf = running ? requestAnimationFrame(frame) : null;   // 最後で停止
+    }
+    function start(){
+      if (raf) cancelAnimationFrame(raf);
+      vt = 0; last = performance.now();
+      raf = requestAnimationFrame(frame);
+    }
+
+    var cap = svg.parentNode.parentNode;
     var btn = cap.querySelector(".replay"), sld = cap.querySelector(".spd"),
         lab = cap.querySelector(".spdv");
     if (btn) btn.onclick = start;
@@ -281,14 +309,7 @@ PLAYER_JS = """
       speed = parseFloat(this.value);
       if (lab) lab.textContent = "×" + speed.toFixed(1);
     };
-  }
-
-  document.querySelectorAll(".player[data-gif]").forEach(function(box){
-    var b64 = data[box.getAttribute("data-gif")];
-    if (!b64) return;
-    setTimeout(function(){
-      try { mount(box, b64); } catch (e) {}
-    }, 0);
+    start();
   });
 })();
 </script>
@@ -359,6 +380,10 @@ STORE_JS = """
    保存先はページごと（data-page-id）に分けるので、日付が違えば混ざらない。
    このブロックは本文より前に置く必要がある — クイズのスクリプトが本文の中で使うため。 */
 (function(){
+  // 筆順SVGは既定で「完成した字」を表示している。JSが動くときだけ各画を隠して
+  // アニメーションの出発点に戻す — このクラスがそのスイッチ。
+  document.documentElement.classList.add("js");
+
   var id = document.body.getAttribute("data-page-id") || location.pathname;
   var PREFIX = "kanji:" + id + ":";
   window.__kanjiStore = {
@@ -713,64 +738,133 @@ def quiz_priority(history: dict, char: str) -> tuple[int, float]:
 
 
 # --------------------------------------------------------------------------- #
-# Stroke-order GIFs
+# KanjiVG の筆順データ
+#
+# ページは筆順をGIFではなくインラインSVGで見せるので、ここで必要なのは
+# KanjiVGの生データ（各画のパス・画数ラベルの位置・viewBox）だけになった。
+# 読み取りは標準ライブラリだけで済むため、このスクリプトはPillowもsvgpathtoolsも
+# conda環境も要らない（GIFを作る kanji_gif.py は単体のツールとして残してある）。
 # --------------------------------------------------------------------------- #
 
-def make_gif(char: str, gifdir: Path, maker: Path, size: int, conda_env: str) -> str | None:
-    """Generate (or reuse) one kanji's stroke-order GIF, base64-encoded.
+SVG_NS = "{http://www.w3.org/2000/svg}"
 
-    Returns None if the GIF could not be produced; the caller renders a
-    placeholder in its place rather than failing the whole page.
+# 画ごとの色。kanji_gif.py の PALETTE と同じ並びにしてあるので、
+# 生成したGIFと見比べても同じ配色になる。
+STROKE_PALETTE = [
+    "#e8453c", "#4a90d9", "#f5a623", "#3aa93a", "#9b7fd4", "#e8194b",
+    "#2c3e50", "#16b79b", "#7b5b3f", "#d45fb0", "#8fb701", "#00a0c6",
+]
 
-    kanji_gif.py needs svgpathtools/Pillow/requests, which only live in the
-    `conda_env` conda environment. We always shell out via `conda run -n
-    <conda_env>` instead of reusing sys.executable, because build_page.py
-    itself may get invoked with a different interpreter (e.g. someone runs
-    `python build_page.py` directly) that lacks those packages — that
-    mismatch used to fail every single kanji silently (caught exception,
-    printed only to stderr, page still written with placeholders).
+
+def _group_by_id_prefix(root: ET.Element, prefix: str) -> ET.Element | None:
+    """The first <g> whose id starts with `prefix`.
+
+    KanjiVG suffixes its group ids with the character's codepoint, so an exact
+    match won't do.
     """
-    codepoint = "%05x" % ord(char)          # KanjiVG names its files by codepoint
-    gif_path = gifdir / f"{codepoint}.gif"
+    for group in root.iter(SVG_NS + "g"):
+        if (group.get("id") or "").startswith(prefix):
+            return group
+    return None
 
-    if not gif_path.exists():
-        gifdir.mkdir(parents=True, exist_ok=True)
-        cmd = ["conda", "run", "-n", conda_env, "python", str(maker),
-               KVG_RAW.format(cp=codepoint),
-               "--outdir", str(gifdir), "--size", str(size), "--grid",
-               "--cache-dir", str(DEFAULT_SVG_CACHE)]
+
+def parse_strokes(svg_text: str) -> dict:
+    """The bits of a KanjiVG file the page needs, as plain data.
+
+    Returns {"box": [minx, miny, w, h], "width": stroke width, "d": [path, ...],
+    "labels": [[x, y], ...]}. Document order in KanjiVG *is* stroke order.
+
+    `labels` may come back empty (or the wrong length) for files without a
+    usable kvg:StrokeNumbers group; the page then places the numbers itself
+    from the path geometry, which the browser can measure exactly.
+    """
+    root = ET.fromstring(svg_text)
+
+    box = root.get("viewBox")
+    if box:
+        minx, miny, width, height = (float(v) for v in re.split(r"[,\s]+", box.strip()))
+    else:
+        minx = miny = 0.0
+        width = float(root.get("width", 109))
+        height = float(root.get("height", 109))
+
+    paths_group = _group_by_id_prefix(root, "kvg:StrokePaths") or root
+    stroke_width = 3.0
+    declared = re.search(r"(?:^|;)\s*stroke-width\s*:\s*([^;]+)",
+                         paths_group.get("style", "") or "")
+    if declared:
         try:
-            subprocess.run(cmd, check=True, capture_output=True, timeout=300)
-        except subprocess.CalledProcessError as e:
-            detail = (e.stderr or b"").decode(errors="replace").strip().splitlines()
-            tail = detail[-1] if detail else "(詳細なし)"
-            print(f"  ! {char} ({codepoint}): GIF生成に失敗 — {tail}", file=sys.stderr)
-            return None
-        except Exception as e:                       # noqa: BLE001
-            print(f"  ! {char} ({codepoint}): GIF生成に失敗 — {e}", file=sys.stderr)
-            return None
+            stroke_width = float(re.sub(r"[^0-9.]", "", declared.group(1)))
+        except ValueError:
+            pass                                      # keep the 3.0 default
 
-    if not gif_path.exists():
-        return None
-    return base64.b64encode(gif_path.read_bytes()).decode()
+    paths = [p.get("d") for p in paths_group.iter(SVG_NS + "path") if p.get("d")]
+    if not paths:
+        raise ValueError("no <path> elements found — is this a KanjiVG file?")
+
+    labels: list[list[float]] = []
+    numbers = _group_by_id_prefix(root, "kvg:StrokeNumbers")
+    if numbers is not None:
+        for text in numbers.iter(SVG_NS + "text"):
+            # Usually positioned by transform="matrix(a b c d e f)", where
+            # (e, f) is the translation; fall back to plain x/y attributes.
+            match = re.search(r"matrix\(([^)]*)\)", text.get("transform", ""))
+            nums = ([float(v) for v in re.split(r"[,\s]+", match.group(1).strip()) if v]
+                    if match else [])
+            if len(nums) == 6:
+                labels.append([nums[4], nums[5]])
+            else:
+                labels.append([float(text.get("x", 0)), float(text.get("y", 0))])
+
+    return {"box": [minx, miny, width, height], "width": stroke_width,
+            "d": paths, "labels": labels if len(labels) == len(paths) else []}
 
 
-def make_gifs(kanji: list[dict], gifdir: Path, maker: Path, size: int,
-              conda_env: str) -> tuple[dict[str, str | None], list[str]]:
-    """Render every kanji's GIF, reporting progress as it goes.
+def fetch_kanjivg(char: str, cache_dir: Path) -> str | None:
+    """One kanji's KanjiVG source, from the cache or from GitHub.
 
-    Returns (char -> base64 GIF or None, list of chars that failed). Shared by
-    the daily page and the weekly review page.
+    Downloads are cached by codepoint, so a repeated character (a review page
+    re-presenting the week) costs nothing and the daily build works offline
+    once a character has been seen.
     """
-    gifs: dict[str, str | None] = {}
+    codepoint = "%05x" % ord(char)                    # KanjiVG names files by codepoint
+    cached = cache_dir / f"{codepoint}.svg"
+    if cached.exists():
+        return cached.read_text(encoding="utf-8")
+    try:
+        with urllib.request.urlopen(KVG_RAW.format(cp=codepoint), timeout=30) as response:
+            svg_text = response.read().decode("utf-8")
+    except Exception as e:                            # noqa: BLE001
+        print(f"  ! {char} ({codepoint}): KanjiVGを取得できません — {e}", file=sys.stderr)
+        return None
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cached.write_text(svg_text, encoding="utf-8")
+    return svg_text
+
+
+def load_strokes(kanji: list[dict],
+                 cache_dir: Path = DEFAULT_SVG_CACHE) -> tuple[dict[str, dict | None], list[str]]:
+    """Stroke data for every kanji. Returns (char -> data or None, failures).
+
+    A character that can't be loaded gets None and a placeholder on the page,
+    rather than failing the whole build. Shared by the daily page and the
+    weekly review page.
+    """
+    strokes: dict[str, dict | None] = {}
     failed: list[str] = []
     for entry in kanji:
         char = entry["char"]
-        print(f"  … {char} のGIFを作成中")
-        gifs[char] = make_gif(char, gifdir, maker, size, conda_env)
-        if not gifs[char]:
+        if char in strokes:
+            continue
+        svg_text = fetch_kanjivg(char, cache_dir)
+        try:
+            strokes[char] = parse_strokes(svg_text) if svg_text else None
+        except Exception as e:                        # noqa: BLE001
+            print(f"  ! {char}: 筆順データを読めません — {e}", file=sys.stderr)
+            strokes[char] = None
+        if not strokes[char]:
             failed.append(char)
-    return gifs, failed
+    return strokes, failed
 
 
 # --------------------------------------------------------------------------- #
@@ -902,27 +996,70 @@ def intro_box_html(theme: str, count: int, chars: str, note: str = "") -> str:
         "赤ではなく画ごとに色が変わり、数字が何画目かを示します。</p>",
         '  <p class="en">※左上の「ふりがな」ボタンで、例文とクイズの読みを表示/非表示にできます。</p>',
         '  <p class="en">※青い見出しをクリックすると、その節をたたんだり開いたりできます。</p>',
+        '  <p class="en">※書き取り練習では「書き順を確認する」で、画数と各画の向きを見てもらえます。</p>',
         '  <p class="en">※チャット欄は左端をドラッグするか「⤢」を押すと広げられます。</p>',
         "</div>",
     ])
 
 
-def stroke_player_html(char: str, strokes: str, has_gif: bool) -> str:
-    """The stroke-order player: an empty frame that PLAYER_JS fills with a canvas.
+def stroke_svg_html(char: str, data: dict) -> str:
+    """The stroke-order drawing as inline SVG: grid, ghost, ink, numbers.
 
-    The GIF is *not* inlined here. It lives in the gif-data block at the end of
-    the page and is looked up by `data-gif`, so this stays a readable handful of
-    lines rather than a quarter-megabyte of base64 sitting in the middle of the
-    content.
+    Every stroke is drawn in full here, so a browser with no JavaScript (and a
+    printout) still shows the finished character. STROKE_JS hides them again —
+    via the html.js class — and draws them back in order. pathLength="1" makes
+    each path's dash offset mean "fraction still unwritten", so the animation
+    needs no length table of its own.
+
+    Numbers are only emitted when KanjiVG gave us anchors for them; otherwise
+    the page places them from the path geometry, which the browser can measure
+    exactly and we cannot without a curve library.
     """
-    frame = (f'<div class="player" data-gif="{attr_esc(char)}">'
-             '<div class="wait">筆順を読み込み中…</div></div>'
-             if has_gif else
-             '<div class="player"><div class="wait">GIFを作れませんでした</div></div>')
+    minx, miny, width, height = data["box"]
+    ink_width = data["width"]
+    paths, labels = data["d"], data["labels"]
+    cx, cy = minx + width / 2, miny + height / 2
+
+    lines = [
+        f'<svg class="strokes" viewBox="{minx:g} {miny:g} {width:g} {height:g}"',
+        f'     data-kanji="{attr_esc(char)}" role="img"'
+        f' aria-label="「{attr_esc(char)}」の筆順（{len(paths)}画）">',
+        '  <g class="grid">',
+        f'    <rect x="{minx:g}" y="{miny:g}" width="{width:g}" height="{height:g}"/>',
+        f'    <line x1="{cx:g}" y1="{miny:g}" x2="{cx:g}" y2="{miny + height:g}"/>',
+        f'    <line x1="{minx:g}" y1="{cy:g}" x2="{minx + width:g}" y2="{cy:g}"/>',
+        "  </g>",
+        f'  <g class="ghost" stroke-width="{ink_width:g}">',
+    ]
+    lines += [f'    <path d="{attr_esc(d)}"/>' for d in paths]
+    lines += ["  </g>", f'  <g class="ink" stroke-width="{ink_width:g}">']
+    lines += [
+        f'    <path pathLength="1" stroke="{STROKE_PALETTE[i % len(STROKE_PALETTE)]}"'
+        f' d="{attr_esc(d)}"/>'
+        for i, d in enumerate(paths)
+    ]
+    lines += ["  </g>"]
+    if labels:
+        lines.append('  <g class="nums">')
+        lines += [f'    <text x="{x:g}" y="{y:g}">{i + 1}</text>'
+                  for i, (x, y) in enumerate(labels)]
+        lines.append("  </g>")
+    lines.append("</svg>")
+    return "\n".join(lines)
+
+
+def stroke_player_html(char: str, strokes: str, data: dict | None) -> str:
+    """The stroke-order box plus its replay/speed controls."""
+    if data:
+        frame = "\n".join(['<div class="player">',
+                           indent(stroke_svg_html(char, data), 1),
+                           "</div>"])
+    else:
+        frame = '<div class="player"><div class="wait">筆順データを読めませんでした</div></div>'
     count = f"（{esc(strokes)}画）" if strokes else ""
     return "\n".join([
         '<div class="anim">',
-        f"  {frame}",
+        indent(frame, 1),
         f'  <span class="cap"><b>「{esc(char)}」の筆順{count}</b><br>',
         '    <span class="ctl">',
         '      <button class="replay" type="button">もう一度見る</button>',
@@ -934,10 +1071,13 @@ def stroke_player_html(char: str, strokes: str, has_gif: bool) -> str:
 
 
 def word_table_html(words: list[dict]) -> str:
-    """The 単語/読み/意味 table. Entries are {"w": word, "r": reading, "m": meaning}."""
+    """The 単語/読み/意味 table. Entries are {"w": word, "r": reading, "m": meaning}.
+
+"""
     rows = [
         f'    <tr><td class="word">{esc(word["w"])}</td>'
-        f'<td>{esc(word["r"])}</td><td>{esc(word.get("m", ""))}</td></tr>'
+        f'<td>{esc(word["r"])}</td>'
+        f'<td>{esc(word.get("m", ""))}</td></tr>'
         for word in words
     ]
     return "\n".join([
@@ -952,12 +1092,11 @@ def word_table_html(words: list[dict]) -> str:
     ])
 
 
-def kanji_section(i: int, kanji: dict, has_gif: bool) -> str:
-    """One kanji's block: heading, readings, stroke-order player, words, examples.
+def kanji_section(i: int, kanji: dict, stroke_data: dict | None) -> str:
+    """One kanji's block: heading, readings, stroke-order drawing, words, examples.
 
-    `i` is the 1-based position used in the heading. `has_gif` says whether a
-    stroke-order GIF was rendered for this character — the data itself goes in
-    the page's gif-data block, not here.
+    `i` is the 1-based position used in the heading. `stroke_data` is this
+    character's KanjiVG paths (or None when they couldn't be loaded).
     """
     char = kanji["char"]
     level = kanji.get("level", "N3").upper()
@@ -985,7 +1124,7 @@ def kanji_section(i: int, kanji: dict, has_gif: bool) -> str:
         parts.append(f'<p class="en"><b>書き方</b>：{"　".join(writing_bits)}</p>')
 
     parts.append("")
-    parts.append(stroke_player_html(char, kanji.get("strokes", ""), has_gif))
+    parts.append(stroke_player_html(char, kanji.get("strokes", ""), stroke_data))
     parts.append("")
     parts.append(word_table_html(kanji.get("words", [])))
     parts.append("")
@@ -998,6 +1137,13 @@ def kanji_section(i: int, kanji: dict, has_gif: bool) -> str:
 def practice_section(kanji: list[dict]) -> str:
     """The handwriting grid: one canvas per kanji, with a faint model to trace.
 
+    Strokes are kept as point arrays rather than as pixels, which is what lets
+    undo, saving and checking all work off the same representation — the canvas
+    is only ever a redraw of that list.
+
+    The check compares each stroke against the KanjiVG path already embedded in
+    this page's stroke-order SVG, so no extra data is needed here.
+
     Note this is an f-string, so every literal brace in the JS below is doubled.
     """
     # A JS array literal of [character, "N画"] pairs, e.g. ["雷","13画"].
@@ -1005,10 +1151,11 @@ def practice_section(kanji: list[dict]) -> str:
         '["%s","%s画"]' % (entry["char"], entry.get("strokes", "")) for entry in kanji
     )
     body = f"""<p class="en">うすいお手本の上をなぞってから、「お手本を隠す」を押して、何も見ないで書いてみてください。
-印刷すると、紙のマス目としても使えます。</p>
+書いたものは保存されるので、ページを開き直しても消えません。印刷すると、紙のマス目としても使えます。</p>
 
 <p>
-  <button class="btn" id="toggleModel">お手本を隠す</button>
+  <button class="btn" id="checkPads">書き順を確認する</button>
+  <button class="btn sub2" id="toggleModel">お手本を隠す</button>
   <button class="btn sub2" id="undoStroke">一画戻す</button>
   <button class="btn sub2" id="clearAll">全部消す</button>
 </p>
@@ -1017,12 +1164,78 @@ def practice_section(kanji: list[dict]) -> str:
 
 <div class="box">
   <p class="en">書き順の基本ルール：①上から下へ　②左から右へ　③横画→縦画　④外側の囲み→中身→最後にふた　⑤左のへんを先に書く。</p>
+  <p class="en">※「書き順を確認する」は、画数と、各画の向き・書き始めの位置をKanjiVGのお手本と
+  くらべる簡易チェックです。形の良し悪しまでは見ていません。</p>
 </div>
 
 <script>
 (function(){{
+  var SIZE = 112;                      // マスの大きさ（CSSピクセル）
   var list = [{items}];
   var grid = document.getElementById("padGrid"), pads = [];
+  var store = window.__kanjiStore;
+  var saved = store ? store.load("pads", {{}}) : {{}};
+
+  /* お手本の各画を「始点→終点」に単純化して、0〜1に正規化して返す。
+     筆順SVGがこのページに既にあるので、字形データを別に持つ必要はない。 */
+  function modelStrokes(char){{
+    var svg = document.querySelector('.strokes[data-kanji="' + char + '"]');
+    if (!svg) return null;
+    var vb = svg.viewBox.baseVal;
+    return Array.prototype.map.call(svg.querySelectorAll(".ink path"), function(p){{
+      var len = p.getTotalLength();
+      var a = p.getPointAtLength(0), b = p.getPointAtLength(len);
+      return {{ax: (a.x - vb.x) / vb.width, ay: (a.y - vb.y) / vb.height,
+              bx: (b.x - vb.x) / vb.width, by: (b.y - vb.y) / vb.height}};
+    }});
+  }}
+
+  function redraw(entry){{
+    var ctx = entry.ctx;
+    ctx.clearRect(0, 0, SIZE, SIZE);
+    entry.strokes.forEach(function(stroke){{
+      if (stroke.length < 2) return;
+      ctx.beginPath();
+      ctx.moveTo(stroke[0][0], stroke[0][1]);
+      for (var i = 1; i < stroke.length; i++) ctx.lineTo(stroke[i][0], stroke[i][1]);
+      ctx.stroke();
+    }});
+  }}
+
+  function persist(){{
+    if (!store) return;
+    var out = {{}};
+    pads.forEach(function(p){{ if (p.strokes.length) out[p.char] = p.strokes; }});
+    store.save("pads", out);
+  }}
+
+  function grade(entry){{
+    var model = modelStrokes(entry.char);
+    var user = entry.strokes;
+    if (!model || !model.length) return {{cls: "", text: ""}};
+    if (!user.length) return {{cls: "", text: ""}};
+
+    var notes = [];
+    if (user.length !== model.length) {{
+      notes.push(model.length + "画のところを" + user.length + "画で書いています");
+    }}
+    var n = Math.min(user.length, model.length);
+    for (var i = 0; i < n; i++) {{
+      var s = user[i], a = s[0], b = s[s.length - 1];
+      var ux = (b[0] - a[0]) / SIZE, uy = (b[1] - a[1]) / SIZE;
+      var mx = model[i].bx - model[i].ax, my = model[i].by - model[i].ay;
+      var lu = Math.sqrt(ux * ux + uy * uy), lm = Math.sqrt(mx * mx + my * my);
+      if (lu < 0.04 || lm < 0.04) continue;        // 点のような画は向きを判定しない
+      var cos = (ux * mx + uy * my) / (lu * lm);
+      var dx = a[0] / SIZE - model[i].ax, dy = a[1] / SIZE - model[i].ay;
+      if (cos < 0.3) notes.push((i + 1) + "画目の向きが違うようです");
+      else if (Math.sqrt(dx * dx + dy * dy) > 0.28) notes.push((i + 1) + "画目の書き始めの位置");
+      if (notes.length >= 3) break;                // 指摘しすぎない
+    }}
+    return notes.length ? {{cls: "ng", text: "△ " + notes.join("／") + "。"}}
+                        : {{cls: "ok", text: "〇 画数も向きも合っています。"}};
+  }}
+
   list.forEach(function(item){{
     var cell = document.createElement("div"); cell.className = "cell";
     var lab = document.createElement("div"); lab.className = "label";
@@ -1031,30 +1244,47 @@ def practice_section(kanji: list[dict]) -> str:
     var mdl = document.createElement("div"); mdl.className = "model"; mdl.textContent = item[0];
     var cv = document.createElement("canvas");
     var dpr = window.devicePixelRatio || 1;
-    cv.width = 112 * dpr; cv.height = 112 * dpr;
+    cv.width = SIZE * dpr; cv.height = SIZE * dpr;
     var ctx = cv.getContext("2d"); ctx.scale(dpr, dpr);
     ctx.lineWidth = 5; ctx.lineCap = "round"; ctx.lineJoin = "round"; ctx.strokeStyle = "#1a1a1a";
+    var res = document.createElement("div"); res.className = "padres";
     var drawing = false;
-    var history = [];
-    var entry = {{pad:pad, ctx:ctx, cv:cv, history:history}};
-    function pos(e){{ var r = cv.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; }}
+    var entry = {{char: item[0], pad: pad, ctx: ctx, cv: cv, res: res,
+                 strokes: (saved[item[0]] || []).slice()}};
+
+    function pos(e){{
+      var r = cv.getBoundingClientRect();
+      return [(e.clientX - r.left) * SIZE / r.width, (e.clientY - r.top) * SIZE / r.height];
+    }}
     cv.addEventListener("pointerdown", function(e){{
-      drawing = true; cv.setPointerCapture(e.pointerId);
+      drawing = true;
+      // マスの外まで一気に引いても線が切れないように。合成イベントでは
+      // 捕捉できない（有効なpointerIdが無い）ので、失敗しても続行する。
+      try {{ cv.setPointerCapture(e.pointerId); }} catch (err) {{}}
       activePad = entry;
-      history.push(ctx.getImageData(0, 0, cv.width, cv.height));
-      if (history.length > 40) history.shift();
-      var p = pos(e); ctx.beginPath(); ctx.moveTo(p[0], p[1]);
+      entry.strokes.push([pos(e)]);
+      res.textContent = ""; res.className = "padres";
     }});
     cv.addEventListener("pointermove", function(e){{
-      if(!drawing) return; var p = pos(e); ctx.lineTo(p[0], p[1]); ctx.stroke();
+      if (!drawing) return;
+      entry.strokes[entry.strokes.length - 1].push(pos(e));
+      redraw(entry);
     }});
     ["pointerup","pointercancel","pointerleave"].forEach(function(t){{
-      cv.addEventListener(t, function(){{ drawing = false; }});
+      cv.addEventListener(t, function(){{
+        if (!drawing) return;
+        drawing = false;
+        persist();
+      }});
     }});
+
     pad.appendChild(mdl); pad.appendChild(cv);
-    cell.appendChild(lab); cell.appendChild(pad); grid.appendChild(cell);
+    cell.appendChild(lab); cell.appendChild(pad); cell.appendChild(res);
+    grid.appendChild(cell);
     pads.push(entry);
+    redraw(entry);                                 // 前回の続きから
   }});
+
   var hidden = false;
   var activePad = null;   // 直前に線を描いたマス（「一画戻す」が対象にする）
   document.getElementById("toggleModel").addEventListener("click", function(){{
@@ -1063,12 +1293,29 @@ def practice_section(kanji: list[dict]) -> str:
     this.textContent = hidden ? "お手本を表示" : "お手本を隠す";
   }});
   document.getElementById("undoStroke").addEventListener("click", function(){{
-    if (!activePad || !activePad.history.length) return;
-    var img = activePad.history.pop();
-    activePad.ctx.putImageData(img, 0, 0);
+    if (!activePad || !activePad.strokes.length) return;
+    activePad.strokes.pop();
+    redraw(activePad);
+    persist();
   }});
   document.getElementById("clearAll").addEventListener("click", function(){{
-    pads.forEach(function(p){{ p.ctx.clearRect(0, 0, p.cv.width, p.cv.height); p.history.length = 0; }});
+    pads.forEach(function(p){{
+      p.strokes.length = 0; redraw(p);
+      p.res.textContent = ""; p.res.className = "padres";
+    }});
+    persist();
+  }});
+  document.getElementById("checkPads").addEventListener("click", function(){{
+    var written = 0;
+    pads.forEach(function(p){{
+      var verdict = grade(p);
+      p.res.textContent = verdict.text;
+      p.res.className = "padres " + verdict.cls;
+      if (p.strokes.length) written++;
+    }});
+    if (!written) {{
+      pads[0].res.textContent = "まずマスに書いてみてください。";
+    }}
   }});
 }})();
 </script>"""
@@ -1214,32 +1461,12 @@ def level_summary(kanji: list[dict]) -> str:
     return "／".join(f"{lvl} {counts[lvl]}字" for lvl in ordered)
 
 
-def gif_data_html(gifs: dict[str, str | None]) -> str:
-    """Every stroke-order GIF as base64, one line per kanji, in a JSON island.
-
-    Parking them here at the end of the page is what keeps the markup above
-    readable: each GIF is a couple of hundred kilobytes of base64 that would
-    otherwise sit inside an <img src> in the middle of the content. PLAYER_JS
-    reads this block and looks each one up by the `data-gif` attribute.
-    """
-    entries = ",\n".join(
-        f"  {json.dumps(char, ensure_ascii=False)}: {json.dumps(b64)}"
-        for char, b64 in gifs.items() if b64
-    )
-    return "\n".join([
-        '<script type="application/json" id="gif-data">',
-        "{",
-        entries,
-        "}",
-        "</script>",
-    ])
-
-
-def build(content: dict, gifs: dict[str, str | None], content_file: str = "",
+def build(content: dict, strokes: dict[str, dict | None], content_file: str = "",
           page_id: str = "") -> str:
     """Assemble the whole self-contained practice page and return it as HTML.
 
-    `gifs` maps character -> base64 GIF (or None when rendering failed).
+    `strokes` maps character -> KanjiVG stroke data (or None when it couldn't
+    be loaded); see load_strokes().
     `content_file` is written onto <body data-content-file> so the "まとめて"
     button can tell the local server which content JSON today's page came from.
     `page_id` namespaces the page's saved quiz answers and chat log; it has to
@@ -1257,7 +1484,7 @@ def build(content: dict, gifs: dict[str, str | None], content_file: str = "",
     for i, entry in enumerate(content["kanji"], 1):
         level = entry.get("level", "N3").upper()
         sections += [banner(f'{i}. {entry["char"]}（{level}）'),
-                     kanji_section(i, entry, bool(gifs.get(entry["char"]))), ""]
+                     kanji_section(i, entry, strokes.get(entry["char"])), ""]
     sections += [banner("書き取り練習"), practice_section(content["kanji"]), ""]
     sections += [banner("復習クイズ"),
                  quiz_section(content["quiz"],
@@ -1313,13 +1540,8 @@ def build(content: dict, gifs: dict[str, str | None], content_file: str = "",
         banner("まとめてボタン（右下に固定）"),
         summarize_button_html(),
         "",
-        banner("筆順GIFのデータ（本文を読みやすく保つため、まとめてここに置いている）"),
-        gif_data_html(gifs),
-        "",
         banner("スクリプト"),
-        # gifdec.js is inlined so the page plays its GIFs on a canvas (speed
-        # control, replay, stop-at-end) instead of as a plain looping <img>.
-        PLAYER_JS % (HERE / "gifdec.js").read_text(encoding="utf-8"),
+        STROKE_JS,
         CHAT_JS,
         CHAT_RESIZE_JS,
         SUMMARIZE_JS,
@@ -1366,12 +1588,10 @@ def main() -> int:
     parser.add_argument("content", type=Path, help="内容を書いたJSONファイル")
     parser.add_argument("--out", type=Path,
                         help="出力HTML（既定：~/Documents/Claude-JP/漢字/漢字練習_<date>.html）")
-    parser.add_argument("--gifdir", type=Path,
-                        default=Path.home() / "Documents" / "Claude-JP" / "漢字" / "gif")
-    parser.add_argument("--maker", type=Path, default=DEFAULT_MAKER, help="kanji_gif.py のパス")
-    parser.add_argument("--size", type=int, default=240, help="GIFの大きさ（px）")
-    parser.add_argument("--skip-gif", action="store_true", help="GIFを作らない（テスト用）")
-    parser.add_argument("--conda-env", default="kanji", help="kanji_gif.py を実行するconda環境名")
+    parser.add_argument("--svg-cache", type=Path, default=DEFAULT_SVG_CACHE,
+                        help="KanjiVGのSVGを置くキャッシュ（既定：スキルフォルダの.kanjivg_cache）")
+    parser.add_argument("--skip-strokes", action="store_true",
+                        help="筆順データを読み込まない（テスト用）")
     parser.add_argument("--kind", choices=["daily", "extra", "review"], default="daily",
                         help="daily=通常の1回、extra=同じ日の追加クラス（既存ファイルに合流する）、"
                              "review=金曜の週次復習")
@@ -1395,15 +1615,14 @@ def main() -> int:
         merged_chars = {entry["char"] for entry in content["kanji"]}
         print(f"  合流先: {content_out}（既存 {len(merged_chars)} 字に合流）")
 
-    gifs: dict[str, str | None] = {}
+    strokes: dict[str, dict | None] = {}
     failed: list[str] = []
-    if not args.skip_gif:
-        gifs, failed = make_gifs(content["kanji"], args.gifdir, args.maker,
-                                 args.size, args.conda_env)
+    if not args.skip_strokes:
+        strokes, failed = load_strokes(content["kanji"], args.svg_cache)
 
     out.parent.mkdir(parents=True, exist_ok=True)
     content_out.write_text(json.dumps(content, ensure_ascii=False, indent=2), encoding="utf-8")
-    out.write_text(build(content, gifs, str(content_out), f"{args.kind}:{day}"),
+    out.write_text(build(content, strokes, str(content_out), f"{args.kind}:{day}"),
                    encoding="utf-8")
 
     history = load_history(args.history)
@@ -1413,16 +1632,16 @@ def main() -> int:
     graded = ingest_quiz_results(history)
     save_history(args.history, history)
 
-    made = sum(1 for gif in gifs.values() if gif)
-    print(f"完了：{out}（GIF {made}/{len(content['kanji'])}）")
+    loaded = sum(1 for data in strokes.values() if data)
+    print(f"完了：{out}（筆順 {loaded}/{len(content['kanji'])}字）")
     if graded:
         print(f"  クイズの成績 {graded} 問分を履歴に記録しました")
     if dupes:
         print(f"警告: 履歴上すでに使用済みの字が含まれています — {'・'.join(dupes)}", file=sys.stderr)
         print("   選定時にkanji_history.jsonを確認し損ねた可能性があります。", file=sys.stderr)
     if failed:
-        print(f"警告: GIFを作れなかった字があります — {'・'.join(failed)}", file=sys.stderr)
-        print("   conda環境やネットワークを確認し、必要なら再実行してください。", file=sys.stderr)
+        print(f"警告: 筆順データを読めなかった字があります — {'・'.join(failed)}", file=sys.stderr)
+        print("   ネットワークを確認し、必要なら再実行してください。", file=sys.stderr)
         return 1
     return 0
 

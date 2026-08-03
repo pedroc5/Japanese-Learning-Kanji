@@ -5,7 +5,7 @@ Pure aggregation, no new content is written by a model here: it reads
 kanji_history.json for this week's day records (kind daily/extra, skipping
 kind=review to avoid recursion), loads each day's saved content_<date>.json,
 merges all kanji (deduped) and all quiz questions, and reuses build_page's
-make_gifs()/build() to assemble the same kind of self-contained HTML page.
+load_strokes()/build() to assemble the same kind of self-contained HTML page.
 
     python build_review.py --date 2026-08-01
 
@@ -87,12 +87,8 @@ def main() -> int:
                         help="この日を含む週を復習する（既定：今日）")
     parser.add_argument("--history", type=Path, default=build_page.DEFAULT_HISTORY)
     parser.add_argument("--out", type=Path, help="出力HTML（既定：<historyの親>/復習_<date>.html）")
-    parser.add_argument("--gifdir", type=Path,
-                        default=Path.home() / "Documents" / "Claude-JP" / "漢字" / "gif")
-    parser.add_argument("--maker", type=Path, default=build_page.DEFAULT_MAKER)
-    parser.add_argument("--size", type=int, default=240)
-    parser.add_argument("--skip-gif", action="store_true")
-    parser.add_argument("--conda-env", default="kanji")
+    parser.add_argument("--svg-cache", type=Path, default=build_page.DEFAULT_SVG_CACHE)
+    parser.add_argument("--skip-strokes", action="store_true")
     args = parser.parse_args()
 
     monday, sunday = week_range(date.fromisoformat(args.date))
@@ -134,29 +130,28 @@ def main() -> int:
         "quiz": merged_quiz,
     }
 
-    gifs: dict[str, str | None] = {}
+    strokes: dict[str, dict | None] = {}
     failed: list[str] = []
-    if not args.skip_gif:
-        gifs, failed = build_page.make_gifs(merged_kanji, args.gifdir, args.maker,
-                                            args.size, args.conda_env)
+    if not args.skip_strokes:
+        strokes, failed = build_page.load_strokes(merged_kanji, args.svg_cache)
 
     out = args.out or (args.history.parent / f"復習_{args.date}.html")
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(build_page.build(merged_content, gifs, page_id=f"review:{args.date}"),
+    out.write_text(build_page.build(merged_content, strokes, page_id=f"review:{args.date}"),
                    encoding="utf-8")
 
     build_page.update_history(history, merged_content, "review", args.date, str(out))
     build_page.save_history(args.history, history)
 
-    made = sum(1 for gif in gifs.values() if gif)
+    loaded = sum(1 for data in strokes.values() if data)
     print(f"完了：{out}（{len(used_dates)}日分・{len(merged_kanji)}字・"
-          f"GIF {made}/{len(merged_kanji)}）")
+          f"筆順 {loaded}/{len(merged_kanji)}字）")
     if graded:
         print(f"  クイズの成績 {graded} 問分を履歴に記録しました")
     if missed:
         print(f"  間違えた字を先頭に並べました — {'・'.join(missed)}")
     if failed:
-        print(f"警告: GIFを作れなかった字があります — {'・'.join(failed)}", file=sys.stderr)
+        print(f"警告: 筆順データを読めなかった字があります — {'・'.join(failed)}", file=sys.stderr)
         return 1
     return 0
 

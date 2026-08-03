@@ -3,19 +3,15 @@
 # — 時刻は com.pedro.kanji-daily.plist の StartCalendarInterval で決まる）
 set -u
 
-# launchd はログインシェルの PATH を引き継がないので、claude や conda のある
-# 場所を明示的に足しておく（これがないと "command not found" で毎朝失敗する）。
+# launchd はログインシェルの PATH を引き継がないので、claude のある場所を明示的に
+# 足しておく（これがないと "command not found" で毎朝失敗する）。
 export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
 LOG="$HOME/Documents/Claude-JP/漢字/build.log"
 mkdir -p "$(dirname "$LOG")"
 
-# conda を使えるようにする（インストール先は環境によって違うので順に探す）
-for c in "/opt/miniconda3" "$HOME/miniconda3" "$HOME/anaconda3" "$HOME/miniforge3" "/opt/homebrew/Caskroom/miniconda/base"; do
-  if [ -f "$c/etc/profile.d/conda.sh" ]; then
-    source "$c/etc/profile.d/conda.sh"
-    break
-  fi
-done
+# conda はもう要らない。筆順はインラインSVGで描くようになり、build_page.py も
+# build_review.py も標準ライブラリだけで動くため、システムの python3 で足りる。
+# （GIFを作る kanji_gif.py だけは今も kanji 環境を使うが、日次では呼ばない。）
 
 # このブロックの出力（標準出力・標準エラーの両方）をまとめてログに追記する
 {
@@ -30,7 +26,7 @@ done
   # 金曜日は、その週の全クラスをまとめた復習ページも作る（機械的な集計なのでclaudeは呼ばない）
   if [ "$(date '+%u')" = "5" ]; then
     echo "-- 金曜日：週次復習を作成 --"
-    conda run -n kanji python "$HOME/.claude/skills/kanji-practice/build_review.py"
+    python3 "$HOME/.claude/skills/kanji-practice/build_review.py"
     echo "review exit: $?"
   fi
 } >>"$LOG" 2>&1

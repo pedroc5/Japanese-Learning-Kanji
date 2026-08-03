@@ -1,6 +1,6 @@
 ---
 name: kanji-practice
-description: Build Pedro's daily JLPT kanji practice page — pick 10 kanji sharing a single theme (e.g. food, city, tools), verify each one's real JLPT level on jlptsensei.com (levels can mix), write the readings, words, examples and quiz in Japanese, generate KanjiVG stroke-order GIFs, and assemble a self-contained HTML file. Use when asked for today's kanji practice, /kanji-practice, or when the daily scheduled run fires.
+description: Build Pedro's daily JLPT kanji practice page — pick 10 kanji sharing a single theme (e.g. food, city, tools), verify each one's real JLPT level on jlptsensei.com (levels can mix), write the readings, words, examples and quiz in Japanese, draw KanjiVG stroke-order animations, and assemble a self-contained HTML file. Use when asked for today's kanji practice, /kanji-practice, or when the daily scheduled run fires.
 ---
 
 # 漢字練習ページを作る
@@ -127,7 +127,7 @@ Pedro（JLPT学習者）向けの毎日の漢字練習HTMLを作る。文章は�
   （`<b><ruby>熟語<rt>じゅくご</rt></ruby></b>`のように、`<b>`が外側）。1文字ずつ分解せず、
   熟語はまとめて1つの`<ruby>`にする（例：`<ruby>宿泊<rt>しゅくはく</rt></ruby>`であって
   `<ruby>宿<rt>しゅく</rt></ruby><ruby>泊<rt>はく</rt></ruby>`ではない）。
-- `strokes` は必ず正しい画数を入れる（書き取り練習のラベルとGIFの説明に使う）。
+- `strokes` は必ず正しい画数を入れる（書き取り練習のラベルと筆順の説明に使う）。
 - `quiz` は**約20問**（10字 × 音読み1問・訓読み1問が目安）。読み方を答える形式。`a` はひらがな。`alt` にはよくある間違い（あれば）。`note` に音読み/訓読みの短い説明。
 - `quiz` の各問には `char`（その問題が問うている字）を必ず入れる。字ごとの正誤を
   `kanji_history.json` に記録し、金曜の復習ページを間違えた字から並べるのに使う。
@@ -139,21 +139,26 @@ Pedro（JLPT学習者）向けの毎日の漢字練習HTMLを作る。文章は�
 ### 6. ページを作る
 
 ```bash
-conda run -n kanji python ~/.claude/skills/kanji-practice/build_page.py /tmp/kanji_content.json
+python3 ~/.claude/skills/kanji-practice/build_page.py /tmp/kanji_content.json
 ```
 
 これが自動でやること:
 
-- KanjiVGのSVGを取得し、`kanji_gif.py` で筆順GIFを作る（`~/Documents/Claude-JP/漢字/gif/` にキャッシュ）
-- GIFをbase64でHTMLに埋め込む（オフラインでも動く）。ただし本文の中には入れず、
-  ページ末尾の `<script type="application/json" id="gif-data">` に字ごとにまとめる
-  （本文のHTMLを人が読める状態に保つため）。`.player[data-gif]` がそれを読んで canvas に描く。
+- KanjiVGのSVGを取得して（`.kanjivg_cache/` にキャッシュ）、筆順を**インラインSVG**として
+  そのまま埋め込む（`stroke_svg_html()`）。各画は `pathLength="1"` を持ち、`STROKE_JS` が
+  `stroke-dashoffset` を 1→0 に動かして順番に書いて見せる。dashの計算は弧長基準なので、
+  曲線のパラメータ化に関係なく筆の速さは一定になる。
+  GIFは作らない — Pillow も svgpathtools も conda環境も要らず、ページも1.8MB→140KB程度になる。
+  JSが動かない環境（印刷も）では、完成した字がそのまま表示される。
+- 書き取り練習のマスは、書いた線を点の列として保存し（開き直しても消えない）、
+  「書き順を確認する」で画数・各画の向き・書き始めの位置を、同じページの筆順SVGと
+  くらべて簡易チェックする。
 - 解答は必ず `<details>` の中に入れる（`open` 属性なし）
 - 見出しごとの節（各漢字・書き取り練習・復習クイズ）は `<details class="sec" open>` で包む
   （`collapsible()`）。既定は開いた状態で、青い見出しをクリックするとたためる。
 - 生成するHTMLは人が読める形で書き出す：入れ子ごとに半角スペース2つでインデントし、
   節の頭に `<!-- ===== … ===== -->` のコメントを置く（`indent()` / `banner()`）
-- クイズの入力欄・答え合わせ、書き取り練習のマス目、GIFの速さスライダーと「もう一度見る」を組み込む
+- クイズの入力欄・答え合わせ、書き取り練習のマス目、筆順の速さスライダーと「もう一度見る」を組み込む
 - ページ右側に、テーマに関係なく何でも質問できるチャットのサイドバーを組み込む（`chatbox_html()`）。
   ローカルの質問サーバー（`ask_server.py`、`http://127.0.0.1:8765`、launchd常駐）に毎回fetchし、
   `claude -p --resume` でそのページを開いている間は会話が続く。サーバーに繋がらない場合だけ、
@@ -179,13 +184,13 @@ conda run -n kanji python ~/.claude/skills/kanji-practice/build_page.py /tmp/kan
 出力先は `~/Documents/Claude-JP/漢字/漢字練習_<date>.html`。
 
 オプション:
-- `--size 240`（GIFの大きさ）、`--skip-gif`（テスト用）、`--out <path>`
+- `--skip-strokes`（筆順を読み込まない・テスト用）、`--svg-cache <dir>`、`--out <path>`
 - **同じ日にもう1クラス追加で頼まれたとき** … その日の `漢字練習_<date>.html` が既にあるかを確認し、
   あれば新しいファイルを作るのではなく、その日のページに**合流**させる：
   1. 新しいクラスの分だけ（テーマ・字10個・単語・クイズ）を通常通りJSONに書く（`date` は同じ日付のまま）。
   2. `--kind extra --append` を付けて実行する：
      ```bash
-     conda run -n kanji python ~/.claude/skills/kanji-practice/build_page.py /tmp/kanji_content.json --kind extra --append
+     python3 ~/.claude/skills/kanji-practice/build_page.py /tmp/kanji_content.json --kind extra --append
      ```
   3. 既存の `content_<date>.json` があれば自動でそこに合流し（字は重複除去、クイズは追加、テーマは
      「Aテーマ＋Bテーマ」のように連結）、同じ `漢字練習_<date>.html` を上書きする。既存ファイルが
@@ -198,7 +203,7 @@ conda run -n kanji python ~/.claude/skills/kanji-practice/build_page.py /tmp/kan
 これは新しいコンテンツを考える必要がない**機械的な集計**なので、そのまま実行するだけでよい：
 
 ```bash
-conda run -n kanji python ~/.claude/skills/kanji-practice/build_review.py
+python3 ~/.claude/skills/kanji-practice/build_review.py
 ```
 
 `kanji_history.json` の `days` からその週の記録（`kind: daily`/`extra`、`review`は除く）を集め、
@@ -212,7 +217,7 @@ conda run -n kanji python ~/.claude/skills/kanji-practice/build_review.py
 
 ### 7.5 変更したら確認する
 
-`build_page.py` を触ったら、コミット前にスモークテストを走らせる（GIFもネットもconda環境も不要）：
+`build_page.py` を触ったら、コミット前にスモークテストを走らせる（ネットもconda環境も不要）：
 
 ```bash
 python3 ~/.claude/skills/kanji-practice/test_build_page.py
@@ -225,7 +230,7 @@ python3 ~/.claude/skills/kanji-practice/test_build_page.py
 
 **チャットには読み方やクイズの解答を書かない。** 作ったHTMLのパスと、「今日のテーマは食べ物です（N4 3字／N3 5字／N2 2字）」程度の1〜2行だけ。金曜日に復習ページも作った場合はそのパスも一言添える。
 
-コマンドの出力にある `GIF x/10` を必ず確認する。10未満、または stderr に「警告」が出ていたら、GIFが埋め込まれずページに「GIFを作れませんでした」というプレースホルダーが残っている状態なので、成功として報告しない。原因（ネットワークやconda環境）を確認し、直してから再実行する。
+コマンドの出力にある `筆順 x/10字` を必ず確認する。10未満、または stderr に「警告」が出ていたら、その字はページに「筆順データを読めませんでした」というプレースホルダーが残っている状態なので、成功として報告しない。ネットワークを確認し、直してから再実行する。
 「履歴上すでに使用済みの字」という警告が出た場合は、選定ミスで既出の字を使ってしまったということなので、
 Pedroにそのまま黙って進めず、次回から気をつける（同じ字を二度と選ばない）。
 
@@ -233,6 +238,7 @@ Pedroにそのまま黙って進めず、次回から気をつける（同じ字
 
 - 筆順データはKanjiVG（CC BY-SA 3.0）。出典表記はページのフッターに入る。
 - `kanji_gif.py`はこのスキルフォルダ自身にある（`~/.claude/skills/kanji-practice/kanji_gif.py`）。
+  ページはもう使っていない（筆順はインラインSVGで描く）が、GIFが欲しいときのための単体ツールとして残してある。
   場所が違うときは `--maker <path>`。SVGのダウンロードキャッシュも
   `~/.claude/skills/kanji-practice/.kanjivg_cache/` に置く（`--cache-dir`で変更可）。
 - `svgpathtools`, `Pillow`, `requests` が必要（conda環境 `kanji` に入っている）。

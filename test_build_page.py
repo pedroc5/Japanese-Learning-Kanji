@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke tests for the page builder — no GIFs, no network, no conda.
+"""Smoke tests for the page builder — no network, no conda.
 
     python3 test_build_page.py
 
@@ -52,6 +52,27 @@ def sample_content() -> dict:
     }
 
 
+SAMPLE_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 109 109">
+  <g id="kvg:StrokePaths_096f7" style="fill:none;stroke:#000000;stroke-width:3">
+    <path id="a" d="M10,10 L90,10"/>
+    <path id="b" d="M50,20 L50,95"/>
+    <path id="c" d="M20,60 L80,60"/>
+  </g>
+  <g id="kvg:StrokeNumbers_096f7">
+    <text transform="matrix(1 0 0 1 6 8)">1</text>
+    <text transform="matrix(1 0 0 1 44 18)">2</text>
+    <text transform="matrix(1 0 0 1 16 58)">3</text>
+  </g>
+</svg>"""
+
+SAMPLE_STROKES = {
+    "box": [0.0, 0.0, 109.0, 109.0],
+    "width": 3.0,
+    "d": ["M10,10 L90,10", "M50,20 L50,95", "M20,60 L80,60"],
+    "labels": [[6.0, 8.0], [44.0, 18.0], [16.0, 58.0]],
+}
+
+
 def quiz_key(page: str) -> list[dict]:
     """Pull window.__quizKey's array back out of the page and parse it.
 
@@ -66,8 +87,8 @@ def quiz_key(page: str) -> list[dict]:
 def markup(page: str) -> str:
     """The page without its trailing script blocks.
 
-    gifdec.js and friends talk *about* tags in their comments, so assertions
-    about what the document contains have to stop before them.
+    The inline scripts talk *about* tags in their comments, so assertions about
+    what the document contains have to stop before them.
     """
     return page.split(build_page.banner("スクリプト"), 1)[0]
 
@@ -103,8 +124,8 @@ class TagBalance(HTMLParser):
 class BuildPageTest(unittest.TestCase):
     def setUp(self) -> None:
         self.content = sample_content()
-        self.gifs = {"雷": "R0lGODlhAQABAAAAACw=", "虹": None}
-        self.page = build_page.build(self.content, self.gifs,
+        self.strokes = {"雷": SAMPLE_STROKES, "虹": None}
+        self.page = build_page.build(self.content, self.strokes,
                                      "/tmp/content_2026-08-02.json", "daily:2026-08-02")
 
     # --- the failure that motivated the suite ---------------------------- #
@@ -141,28 +162,59 @@ class BuildPageTest(unittest.TestCase):
         answers = self.page.split("<summary>解答を表示</summary>", 1)[0]
         self.assertTrue(answers.rstrip().endswith("<details>"))
 
-    # --- the GIF island -------------------------------------------------- #
+    # --- stroke-order SVG ------------------------------------------------ #
 
-    def test_gifs_live_at_the_end_not_in_the_body(self):
+    def test_strokes_are_inline_svg_not_a_raster(self):
         self.assertNotIn("<img", markup(self.page))
         self.assertNotIn("data:image/gif", self.page)
-        self.assertIn('<div class="player" data-gif="雷">', self.page)
-        # 虹 failed to render, so it gets a placeholder and no data-gif hook
+        self.assertIn('<svg class="strokes" viewBox="0 0 109 109"', self.page)
+        # 虹 has no data, so it gets a placeholder instead of an empty drawing
         self.assertIn('<div class="player"><div class="wait">', self.page)
 
-    def test_gif_data_is_valid_json_and_only_has_rendered_gifs(self):
-        block = self.page.split('id="gif-data">\n', 1)[1].split("\n</script>", 1)[0]
-        self.assertEqual(json.loads(block), {"雷": "R0lGODlhAQABAAAAACw="})
+    def test_every_stroke_is_drawn_and_numbered(self):
+        svg = self.page.split('<svg class="strokes"', 1)[1].split("</svg>", 1)[0]
+        self.assertEqual(svg.count('<path pathLength="1"'), 3)   # ink
+        self.assertEqual(svg.count("<path d="), 3)               # ghost
+        self.assertEqual(svg.count("<text "), 3)                 # numbers
 
-    # --- quiz -> kanji attribution --------------------------------------- #
+    def test_the_drawing_is_complete_without_javascript(self):
+        """No dash offsets in the markup: html.js is what hides the strokes."""
+        svg = self.page.split('<svg class="strokes"', 1)[1].split("</svg>", 1)[0]
+        self.assertNotIn("stroke-dashoffset", svg)
+        self.assertIn("html.js .strokes .ink path{stroke-dasharray:1", self.page)
 
-    def test_questions_are_attributed_to_their_kanji(self):
-        key = quiz_key(self.page)
-        self.assertEqual([entry["char"] for entry in key], ["雷", "虹", ""])
+    def test_the_hidden_dash_gap_outruns_the_path(self):
+        """A gap of 1 makes the pattern repeat at the path's end, and the
+        zero-length dash there is painted as a dot by round linecaps — a
+        coloured pip on every stroke that hasn't been drawn yet."""
+        rule = re.search(r"html\.js \.strokes \.ink path\{stroke-dasharray:([^;]+);", self.page)
+        dash, gap = (float(v) for v in rule.group(1).split())
+        self.assertEqual(dash, 1)          # pathLength="1" なので画の全長
+        self.assertGreater(gap, dash)
 
-    def test_an_explicit_char_wins_over_inference(self):
-        quiz = [{"q": "<b>雷雨</b>", "a": "らいう", "char": "虹"}]
-        self.assertEqual(build_page.quiz_chars(quiz, self.content["kanji"]), ["虹"])
+    def test_numbers_are_dropped_when_kanjivg_has_no_anchors(self):
+        data = dict(SAMPLE_STROKES, labels=[])
+        page = build_page.build(self.content, {"雷": data, "虹": None})
+        svg = page.split('<svg class="strokes"', 1)[1].split("</svg>", 1)[0]
+        self.assertNotIn('<g class="nums">', svg)
+
+    # --- KanjiVG parsing -------------------------------------------------- #
+
+    def test_parse_strokes_reads_paths_labels_and_box(self):
+        data = build_page.parse_strokes(SAMPLE_SVG)
+        self.assertEqual(data["box"], [0.0, 0.0, 109.0, 109.0])
+        self.assertEqual(data["d"], ["M10,10 L90,10", "M50,20 L50,95", "M20,60 L80,60"])
+        self.assertEqual(data["labels"], [[6.0, 8.0], [44.0, 18.0], [16.0, 58.0]])
+        self.assertEqual(data["width"], 3.0)
+
+    def test_mismatched_label_count_is_discarded(self):
+        """A partial StrokeNumbers group would mis-number every stroke after it."""
+        svg = SAMPLE_SVG.replace('<text transform="matrix(1 0 0 1 16 58)">3</text>', "")
+        self.assertEqual(build_page.parse_strokes(svg)["labels"], [])
+
+    def test_a_file_with_no_paths_is_rejected(self):
+        with self.assertRaises(ValueError):
+            build_page.parse_strokes('<svg xmlns="http://www.w3.org/2000/svg"></svg>')
 
     # --- drafts ----------------------------------------------------------- #
 
