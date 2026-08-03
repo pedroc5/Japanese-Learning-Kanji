@@ -41,6 +41,7 @@ CSS = """
   :root{
     --navy:#1c3f66; --accent:#b3541e; --green:#1c6640;
     --light:#eef2f7; --peach:#fdf1e7; --grey:#666; --border:#c3cdd9;
+    --chat-w:260px;   /* チャット欄の幅。ドラッグや「⤢」でJSが書き換える */
   }
   *{box-sizing:border-box}
   body{
@@ -56,14 +57,28 @@ CSS = """
                     padding:8px 18px; cursor:pointer; box-shadow:0 2px 8px rgba(0,0,0,.15)}
   .furigana-toggle:hover{background:var(--light)}
   body.furigana-on .furigana-toggle{background:var(--navy); color:#fff}
-  .page{display:flex; align-items:flex-start; gap:24px; max-width:1120px; margin:0 auto}
+  /* ページ全体はチャット欄の幅に合わせて広がる（本文の幅は820pxのまま）。 */
+  .page{display:flex; align-items:flex-start; gap:24px; margin:0 auto;
+        max-width:calc(820px + 24px + var(--chat-w))}
   .wrap{flex:1 1 auto; min-width:0; max-width:820px; background:#fff; padding:40px 44px 48px;
         border-radius:10px; box-shadow:0 1px 4px rgba(0,0,0,.08)}
-  .chatbox{flex:0 0 260px; width:260px; position:sticky; top:20px; align-self:flex-start;
-           background:#fff; padding:16px 18px; border-radius:10px;
+  .chatbox{flex:0 0 var(--chat-w); width:var(--chat-w); position:sticky; top:20px;
+           align-self:flex-start; background:#fff; padding:16px 18px; border-radius:10px;
            box-shadow:0 1px 4px rgba(0,0,0,.08); max-height:calc(100vh - 40px);
            display:flex; flex-direction:column}
+  .chatbox-head{display:flex; align-items:flex-start; justify-content:space-between; gap:8px}
   .chatbox-title{font-size:17px; font-weight:700; color:var(--navy); margin-bottom:4px}
+  /* 左端のつまみ：横にドラッグしてチャット欄の幅を変える */
+  .chat-resize{position:absolute; top:0; left:-12px; width:14px; height:100%;
+               cursor:col-resize; z-index:2}
+  .chat-resize::before{content:""; position:absolute; top:50%; left:5px; margin-top:-22px;
+                       width:4px; height:44px; border-radius:2px; background:var(--border)}
+  .chat-resize:hover::before{background:var(--navy)}
+  body.chat-resizing{cursor:col-resize; user-select:none}
+  .chat-expand{font-family:inherit; font-size:14px; line-height:1; color:var(--navy);
+               background:#fff; border:1px solid var(--border); border-radius:4px;
+               padding:5px 8px; cursor:pointer; flex:0 0 auto}
+  .chat-expand:hover{background:var(--light); border-color:var(--navy)}
   .chatlog{flex:1 1 auto; min-height:80px; overflow-y:auto; margin:8px 0; padding-right:2px}
   .chatmsg{font-size:13px; line-height:1.6; margin-bottom:10px; white-space:pre-wrap}
   .chatmsg .who{display:block; font-size:11px; font-weight:700; margin-bottom:2px}
@@ -120,7 +135,6 @@ CSS = """
   .player{position:relative; width:170px; height:170px; border:2px solid var(--navy);
           border-radius:6px; background:#fff; overflow:hidden}
   .player canvas{display:block; width:170px; height:170px}
-  .player img{display:block; width:170px; height:170px}
   .player .wait{font-size:13px; color:var(--grey); text-align:center; padding-top:72px}
   .ctl{display:inline-flex; align-items:center; gap:8px; flex-wrap:wrap; margin-top:6px}
   .ctl input[type=range]{width:130px; vertical-align:middle}
@@ -158,6 +172,18 @@ CSS = """
   summary::before{content:"▶ "; font-size:12px}
   details[open] summary::before{content:"▼ "}
   details > *:last-child{padding-bottom:12px}
+  /* details.sec — 見出しごとのたたみ込み。既定はすべて開いた状態で、
+     見出し(h2)そのものがクリック領域になる。上の details の見た目（解答欄など）は
+     打ち消して、h2の帯だけが見えるようにする。 */
+  details.sec{margin:0; padding:0; background:none; border-radius:0}
+  details.sec > summary{padding:0; font-weight:inherit; color:inherit}
+  details.sec > summary::before{content:none}
+  details.sec > summary h2{position:relative; padding-right:36px}
+  details.sec > summary h2::after{content:"▼"; position:absolute; right:14px; top:50%;
+                                  transform:translateY(-50%); font-size:12px; opacity:.8}
+  details.sec:not([open]) > summary h2::after{content:"▶"}
+  details.sec > summary:hover h2{background:#25517f}
+  details.sec > *:last-child{padding-bottom:0}
   .foot{color:var(--grey); font-size:14px; margin-top:34px; padding-top:16px;
         border-top:1px solid var(--border)}
   .chatta{width:100%; font-family:inherit; font-size:13px; line-height:1.5; color:#1a1a1a;
@@ -175,10 +201,12 @@ CSS = """
                  border-radius:6px; box-shadow:0 1px 4px rgba(0,0,0,.15); max-width:260px;
                  text-align:right}
   .summarize-msg a{color:var(--navy)}
+  /* 縦並びになる幅では、チャットは本文と同じ幅いっぱいなので、幅の調整はできなくする。 */
   @media (max-width:900px){
-    .page{flex-direction:column}
+    .page{flex-direction:column; max-width:820px}
     .chatbox{position:static; width:100%; max-height:none; flex:none}
     .chatlog{min-height:160px; max-height:320px}
+    .chat-resize, .chat-expand{display:none}
   }
   @media (max-width:600px){
     body{padding:16px 10px 40px}
@@ -200,39 +228,116 @@ CSS = """
 
 PLAYER_JS = """
 <script>
-/* 埋め込みGIFを解析して canvas で再生する（速さ調整・もう一度・最後で停止） */
+/* 筆順GIFを解析して canvas で再生する（速さ調整・もう一度・最後で停止）。
+   GIF本体は本文ではなくページ末尾の <script id="gif-data"> に字ごとにまとめてあり
+   （本文のHTMLを人が読めるようにするため）、ここで字を鍵に取り出して復号する。
+   1字ずつ setTimeout に分けるのは、10字を一度に復号してページを固まらせないため。 */
 %s
 (function(){
-  document.querySelectorAll(".player img").forEach(function(img){
-    fetch(img.src).then(function(r){ return r.arrayBuffer(); }).then(function(buf){
-      var g = composeFrames(decodeGIF(new Uint8Array(buf)));
-      if (!g.frames.length) return;
-      var box = img.parentNode, cv = document.createElement("canvas");
-      cv.width = g.width; cv.height = g.height;
-      box.innerHTML = ""; box.appendChild(cv);
-      var ctx = cv.getContext("2d");
-      var frames = g.frames.map(function(f){
-        var im = ctx.createImageData(g.width, g.height);
-        im.data.set(f.data); im.delay = f.delay; return im;
-      });
-      var speed = 1, timer = null, idx = 0;
-      function draw(){
-        ctx.putImageData(frames[idx], 0, 0);
-        if (idx >= frames.length - 1) return;      // 最後で停止
-        timer = setTimeout(function(){ idx++; draw(); },
-                           Math.max(20, frames[idx].delay / speed));
-      }
-      function start(){ clearTimeout(timer); idx = 0; draw(); }
-      start();
-      var cap = box.parentNode;
-      var btn = cap.querySelector(".replay"), sld = cap.querySelector(".spd"),
-          lab = cap.querySelector(".spdv");
-      if (btn) btn.onclick = start;
-      if (sld) sld.oninput = function(){
-        speed = parseFloat(this.value);
-        if (lab) lab.textContent = "×" + speed.toFixed(1);
-      };
-    }).catch(function(){});
+  var holder = document.getElementById("gif-data");
+  if (!holder) return;
+  var data;
+  try { data = JSON.parse(holder.textContent); } catch (e) { return; }
+
+  function toBytes(b64){
+    var bin = atob(b64), out = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  function mount(box, b64){
+    var g = composeFrames(decodeGIF(toBytes(b64)));
+    if (!g.frames.length) return;
+    var cv = document.createElement("canvas");
+    cv.width = g.width; cv.height = g.height;
+    box.innerHTML = ""; box.appendChild(cv);
+    var ctx = cv.getContext("2d");
+    var frames = g.frames.map(function(f){
+      var im = ctx.createImageData(g.width, g.height);
+      im.data.set(f.data); im.delay = f.delay; return im;
+    });
+    var speed = 1, timer = null, idx = 0;
+    function draw(){
+      ctx.putImageData(frames[idx], 0, 0);
+      if (idx >= frames.length - 1) return;      // 最後で停止
+      timer = setTimeout(function(){ idx++; draw(); },
+                         Math.max(20, frames[idx].delay / speed));
+    }
+    function start(){ clearTimeout(timer); idx = 0; draw(); }
+    start();
+    var cap = box.parentNode;
+    var btn = cap.querySelector(".replay"), sld = cap.querySelector(".spd"),
+        lab = cap.querySelector(".spdv");
+    if (btn) btn.onclick = start;
+    if (sld) sld.oninput = function(){
+      speed = parseFloat(this.value);
+      if (lab) lab.textContent = "×" + speed.toFixed(1);
+    };
+  }
+
+  document.querySelectorAll(".player[data-gif]").forEach(function(box){
+    var b64 = data[box.getAttribute("data-gif")];
+    if (!b64) return;
+    setTimeout(function(){
+      try { mount(box, b64); } catch (e) {}
+    }, 0);
+  });
+})();
+</script>
+"""
+
+
+CHAT_RESIZE_JS = """
+<script>
+/* チャット欄の幅：左端のつまみを横にドラッグするか、「⤢」で広い幅に切り替える。
+   幅は --chat-w というCSS変数ひとつで決まり（.chatbox の幅と .page の最大幅の両方が
+   これを見ている）、localStorageに覚えるので次に開くページでも同じ幅になる。 */
+(function(){
+  var MIN = 220, MAX = 760, WIDE = 520, DEFAULT = 260, KEY = "kanjiChatWidth";
+  var handle = document.getElementById("chatResize");
+  var expand = document.getElementById("chatExpand");
+  var width = DEFAULT, narrow = DEFAULT;
+
+  function apply(px){
+    width = Math.max(MIN, Math.min(MAX, Math.round(px)));
+    document.documentElement.style.setProperty("--chat-w", width + "px");
+    if (expand) {
+      var wide = width >= WIDE;
+      expand.textContent = wide ? "⤡" : "⤢";
+      expand.title = wide ? "チャットを元の幅に戻す" : "チャットを広げる";
+    }
+    return width;
+  }
+  function remember(){ try { localStorage.setItem(KEY, width); } catch (e) {} }
+
+  var saved = 0;
+  try { saved = parseInt(localStorage.getItem(KEY), 10) || 0; } catch (e) { saved = 0; }
+  apply(saved || DEFAULT);
+  if (width < WIDE) narrow = width;
+
+  if (handle) handle.addEventListener("pointerdown", function(e){
+    e.preventDefault();
+    var startX = e.clientX, startW = width;
+    handle.setPointerCapture(e.pointerId);
+    document.body.classList.add("chat-resizing");
+    function move(ev){ apply(startW + (startX - ev.clientX)); }  // 左へ引くほど広がる
+    function up(){
+      handle.removeEventListener("pointermove", move);
+      handle.removeEventListener("pointerup", up);
+      handle.removeEventListener("pointercancel", up);
+      document.body.classList.remove("chat-resizing");
+      if (width < WIDE) narrow = width;
+      remember();
+    }
+    handle.addEventListener("pointermove", move);
+    handle.addEventListener("pointerup", up);
+    handle.addEventListener("pointercancel", up);
+  });
+
+  if (expand) expand.addEventListener("click", function(){
+    if (width < WIDE) { narrow = width; apply(WIDE); }
+    else { apply(narrow || DEFAULT); }
+    remember();
   });
 })();
 </script>
@@ -569,64 +674,170 @@ def attr_esc(s: str) -> str:
     return html.escape(str(s), quote=True)
 
 
+def indent(block: str, level: int) -> str:
+    """Indent every non-blank line of `block` by `level` steps of two spaces.
+
+    Each builder below writes its markup as if it were at the top level; the
+    caller pushes it to its real depth with this. That is what keeps the
+    generated page indented like hand-written HTML instead of one flat wall.
+    """
+    pad = "  " * level
+    return "\n".join(pad + line if line.strip() else line for line in block.split("\n"))
+
+
+def banner(text: str) -> str:
+    """A comment marking off a top-level part of the page, for eyeball navigation."""
+    return f"<!-- ===== {text} ===== -->"
+
+
+def collapsible(heading: str, body: str) -> str:
+    """Wrap a section in a fold-away <details>, open to start with.
+
+    Same mechanism as the quiz's 解答 fold, but the section's own <h2> is the
+    <summary>, so the navy heading bar itself is the click target.
+    """
+    return "\n".join([
+        '<details class="sec" open>',
+        f"  <summary>{heading}</summary>",
+        '  <div class="sec-body">',
+        indent(body, 2),
+        "  </div>",
+        "</details>",
+    ])
+
+
 def chatbox_html() -> str:
     """A general-purpose chat sidebar: no kanji/page context is injected —
     Pedro can ask about anything, not just today's practice. The local
     ask_server answers in a Japanese-teacher voice (see ASK_SYSTEM_PROMPT
     there) and keeps each browser tab's messages as one ongoing conversation
     (via `claude -p --resume`), so this renders a running transcript rather
-    than a single one-off answer."""
-    return (
-        '<aside class="chatbox">'
-        '<div class="chatbox-title">Claudeに質問する</div>'
-        '<p class="en">今日の練習に限らず、日本語のことなら何でも質問できます。</p>'
-        '<div class="chatlog" id="chatlog"></div>'
-        '<div class="chatinput">'
-        '<textarea class="chatta" id="chatta" rows="2" '
-        'placeholder="質問を入力してください（Shift+Enterで送信）"></textarea>'
-        '<div class="chatctl"><button class="chatsend" id="chatsend" type="button">送信</button>'
-        '<span class="chat-msg" id="chatmsg"></span></div>'
-        '</div></aside>'
-    )
+    than a single one-off answer.
+
+    The grip on the left edge and the ⤢ button both feed CHAT_RESIZE_JS, which
+    widens the sidebar (and the page around it) for longer answers.
+    """
+    return "\n".join([
+        '<aside class="chatbox" id="chatbox">',
+        '  <div class="chat-resize" id="chatResize" title="ドラッグして幅を変える"></div>',
+        '  <div class="chatbox-head">',
+        '    <div class="chatbox-title">Claudeに質問する</div>',
+        '    <button class="chat-expand" id="chatExpand" type="button"',
+        '            title="チャットを広げる" aria-label="チャットの幅を変える">⤢</button>',
+        "  </div>",
+        '  <p class="en">今日の練習に限らず、日本語のことなら何でも質問できます。</p>',
+        '  <div class="chatlog" id="chatlog"></div>',
+        '  <div class="chatinput">',
+        '    <textarea class="chatta" id="chatta" rows="2"',
+        '              placeholder="質問を入力してください（Shift+Enterで送信）"></textarea>',
+        '    <div class="chatctl">',
+        '      <button class="chatsend" id="chatsend" type="button">送信</button>',
+        '      <span class="chat-msg" id="chatmsg"></span>',
+        "    </div>",
+        "  </div>",
+        "</aside>",
+    ])
 
 
 def summarize_button_html() -> str:
     """Fixed bottom-right button that asks the local server to write a
     separate まとめ_<date>.html recapping today's kanji, quiz answers (read
     live from the quiz inputs), and the chat conversation so far."""
-    return (
-        '<div class="summarize-box">'
-        '<span class="summarize-msg" id="summarizeMsg"></span>'
-        '<button class="summarize-btn" id="summarizeBtn" type="button">まとめて</button>'
-        '</div>'
-    )
+    return "\n".join([
+        '<div class="summarize-box">',
+        '  <span class="summarize-msg" id="summarizeMsg"></span>',
+        '  <button class="summarize-btn" id="summarizeBtn" type="button">まとめて</button>',
+        "</div>",
+    ])
 
 
 def furigana_toggle_html() -> str:
     """Fixed top-left toggle. Every kanji in examples/quiz questions is
     authored with <ruby>...<rt>reading</rt></ruby>; the <rt> is hidden by
     CSS by default and this button flips a body class to reveal it."""
-    return (
-        '<div class="furigana-toggle-box">'
-        '<button class="furigana-toggle" id="furiganaToggle" type="button">ふりがな</button>'
-        '</div>'
-    )
+    return "\n".join([
+        '<div class="furigana-toggle-box">',
+        '  <button class="furigana-toggle" id="furiganaToggle" type="button">ふりがな</button>',
+        "</div>",
+    ])
 
 
-def kanji_section(i: int, kanji: dict, gif_b64: str | None) -> str:
+def intro_box_html(theme: str, count: int, chars: str) -> str:
+    """The orange "how to use this page" box under the title."""
+    return "\n".join([
+        '<div class="box warm">',
+        f"  <p>今日のテーマ：{esc(theme)}　／　今日の{count}字：{chars}</p>",
+        '  <p class="en">まず読み方と単語を確認してから、最後の復習クイズに挑戦してください。</p>',
+        '  <p class="en">※筆順アニメーションは KanjiVG（CC BY-SA 3.0）のデータから作成しています。'
+        "赤ではなく画ごとに色が変わり、数字が何画目かを示します。</p>",
+        '  <p class="en">※左上の「ふりがな」ボタンで、例文とクイズの読みを表示/非表示にできます。</p>',
+        '  <p class="en">※青い見出しをクリックすると、その節をたたんだり開いたりできます。</p>',
+        '  <p class="en">※チャット欄は左端をドラッグするか「⤢」を押すと広げられます。</p>',
+        "</div>",
+    ])
+
+
+def stroke_player_html(char: str, strokes: str, has_gif: bool) -> str:
+    """The stroke-order player: an empty frame that PLAYER_JS fills with a canvas.
+
+    The GIF is *not* inlined here. It lives in the gif-data block at the end of
+    the page and is looked up by `data-gif`, so this stays a readable handful of
+    lines rather than a quarter-megabyte of base64 sitting in the middle of the
+    content.
+    """
+    frame = (f'<div class="player" data-gif="{attr_esc(char)}">'
+             '<div class="wait">筆順を読み込み中…</div></div>'
+             if has_gif else
+             '<div class="player"><div class="wait">GIFを作れませんでした</div></div>')
+    count = f"（{esc(strokes)}画）" if strokes else ""
+    return "\n".join([
+        '<div class="anim">',
+        f"  {frame}",
+        f'  <span class="cap"><b>「{esc(char)}」の筆順{count}</b><br>',
+        '    <span class="ctl">',
+        '      <button class="replay" type="button">もう一度見る</button>',
+        '      <label>速さ <input type="range" class="spd" min="0.25" max="3" step="0.25" value="1"></label>',
+        '      <b class="spdv">×1.0</b>',
+        "    </span></span>",
+        "</div>",
+    ])
+
+
+def word_table_html(words: list[dict]) -> str:
+    """The 単語/読み/意味 table. Entries are {"w": word, "r": reading, "m": meaning}."""
+    rows = [
+        f'    <tr><td class="word">{esc(word["w"])}</td>'
+        f'<td>{esc(word["r"])}</td><td>{esc(word.get("m", ""))}</td></tr>'
+        for word in words
+    ]
+    return "\n".join([
+        "<table>",
+        "  <thead>",
+        "    <tr><th>単語</th><th>読み</th><th>意味</th></tr>",
+        "  </thead>",
+        "  <tbody>",
+        *rows,
+        "  </tbody>",
+        "</table>",
+    ])
+
+
+def kanji_section(i: int, kanji: dict, has_gif: bool) -> str:
     """One kanji's block: heading, readings, stroke-order player, words, examples.
 
-    `i` is the 1-based position used in the heading.
+    `i` is the 1-based position used in the heading. `has_gif` says whether a
+    stroke-order GIF was rendered for this character — the data itself goes in
+    the page's gif-data block, not here.
     """
     char = kanji["char"]
     level = kanji.get("level", "N3").upper()
     # "N2" -> "lvl n2" so the CSS can colour-code the badge; anything unexpected
     # falls back to the plain badge.
     level_class = f"lvl n{level[1:]}" if level.startswith("N") and level[1:].isdigit() else "lvl"
+    heading = (f'<h2>{i}. <span class="kanji">{esc(char)}</span>'
+               f'<span class="{level_class}">{esc(level)}</span></h2>')
 
     parts = [
-        f'<h2>{i}. <span class="kanji">{esc(char)}</span>'
-        f'<span class="{level_class}">{esc(level)}</span></h2>',
         f'<p><b>訓読み</b>：{esc(kanji.get("kun", "—"))}　／　'
         f'<b>音読み</b>：{esc(kanji.get("on", "—"))}</p>',
         f'<p class="en">意味：{esc(kanji.get("meaning", ""))}</p>',
@@ -643,31 +854,15 @@ def kanji_section(i: int, kanji: dict, gif_b64: str | None) -> str:
     if writing_bits:
         parts.append(f'<p class="en"><b>書き方</b>：{"　".join(writing_bits)}</p>')
 
-    strokes = kanji.get("strokes", "")
-    player = (f'<img src="data:image/gif;base64,{gif_b64}" alt="「{esc(char)}」の筆順">'
-              if gif_b64 else '<div class="wait">GIFを作れませんでした</div>')
-    parts.append(
-        '<div class="anim">'
-        f'<div class="player">{player}</div>'
-        f'<span class="cap"><b>「{esc(char)}」の筆順'
-        f'{f"（{esc(strokes)}画）" if strokes else ""}</b><br>'
-        '<span class="ctl"><button class="replay" type="button">もう一度見る</button>'
-        '<label>速さ <input type="range" class="spd" min="0.25" max="3" step="0.25" value="1"></label>'
-        '<b class="spdv">×1.0</b></span></span></div>'
-    )
-
-    # words entries are {"w": word, "r": reading, "m": meaning}
-    rows = "\n".join(
-        f'    <tr><td class="word">{esc(word["w"])}</td>'
-        f'<td>{esc(word["r"])}</td><td>{esc(word.get("m", ""))}</td></tr>'
-        for word in kanji.get("words", [])
-    )
-    parts.append('<table>\n  <thead><tr><th>単語</th><th>読み</th><th>意味</th></tr></thead>\n'
-                 f'  <tbody>\n{rows}\n  </tbody>\n</table>')
+    parts.append("")
+    parts.append(stroke_player_html(char, kanji.get("strokes", ""), has_gif))
+    parts.append("")
+    parts.append(word_table_html(kanji.get("words", [])))
+    parts.append("")
 
     for example in kanji.get("examples", []):
         parts.append(f'<p class="ex">・{example}</p>')  # 例文は <b> や <ruby> を含むので escape しない
-    return "\n".join(parts)
+    return collapsible(heading, "\n".join(parts).rstrip())
 
 
 def practice_section(kanji: list[dict]) -> str:
@@ -679,19 +874,21 @@ def practice_section(kanji: list[dict]) -> str:
     items = ", ".join(
         '["%s","%s画"]' % (entry["char"], entry.get("strokes", "")) for entry in kanji
     )
-    return f"""
-<h2>書き取り練習(マウス・指で書いてみましょう)</h2>
-<p class="en">うすいお手本の上をなぞってから、「お手本を隠す」を押して、何も見ないで書いてみてください。
+    body = f"""<p class="en">うすいお手本の上をなぞってから、「お手本を隠す」を押して、何も見ないで書いてみてください。
 印刷すると、紙のマス目としても使えます。</p>
+
 <p>
   <button class="btn" id="toggleModel">お手本を隠す</button>
   <button class="btn sub2" id="undoStroke">一画戻す</button>
   <button class="btn sub2" id="clearAll">全部消す</button>
 </p>
+
 <div class="grid" id="padGrid"></div>
+
 <div class="box">
   <p class="en">書き順の基本ルール：①上から下へ　②左から右へ　③横画→縦画　④外側の囲み→中身→最後にふた　⑤左のへんを先に書く。</p>
 </div>
+
 <script>
 (function(){{
   var list = [{items}];
@@ -744,8 +941,8 @@ def practice_section(kanji: list[dict]) -> str:
     pads.forEach(function(p){{ p.ctx.clearRect(0, 0, p.cv.width, p.cv.height); p.history.length = 0; }});
   }});
 }})();
-</script>
-"""
+</script>"""
+    return collapsible("<h2>書き取り練習(マウス・指で書いてみましょう)</h2>", body)
 
 
 def quiz_section(quiz: list[dict]) -> str:
@@ -770,9 +967,8 @@ def quiz_section(quiz: list[dict]) -> str:
             f'    <li>{esc(question["a"])}{("（" + esc(note) + "）") if note else ""}</li>')
         alts = json.dumps(question.get("alt", []), ensure_ascii=False)
         answer_key.append('    {ok:["%s"], alt:%s, exp:"%s"}' % (question["a"], alts, esc(note)))
-    return """
-<h2>復習クイズ(読み方をひらがなで書いてください)</h2>
-<p class="en">下の欄に入力して、「答え合わせ」ボタンを押すと、正しいか正しくないかを説明します。</p>
+    body = """<p class="en">下の欄に入力して、「答え合わせ」ボタンを押すと、正しいか正しくないかを説明します。</p>
+
 <ol id="quiz">
 %s
 </ol>
@@ -819,8 +1015,8 @@ def quiz_section(quiz: list[dict]) -> str:
     document.querySelectorAll("span.res").forEach(function(s){s.innerHTML="";});
   });
 })();
-</script>
-""" % ("\n".join(question_items), "\n".join(answer_items), ",\n".join(answer_key))
+</script>""" % ("\n".join(question_items), "\n".join(answer_items), ",\n".join(answer_key))
+    return collapsible("<h2>復習クイズ(読み方をひらがなで書いてください)</h2>", body)
 
 
 def level_summary(kanji: list[dict]) -> str:
@@ -839,54 +1035,110 @@ def level_summary(kanji: list[dict]) -> str:
     return "／".join(f"{lvl} {counts[lvl]}字" for lvl in ordered)
 
 
+def gif_data_html(gifs: dict[str, str | None]) -> str:
+    """Every stroke-order GIF as base64, one line per kanji, in a JSON island.
+
+    Parking them here at the end of the page is what keeps the markup above
+    readable: each GIF is a couple of hundred kilobytes of base64 that would
+    otherwise sit inside an <img src> in the middle of the content. PLAYER_JS
+    reads this block and looks each one up by the `data-gif` attribute.
+    """
+    entries = ",\n".join(
+        f"  {json.dumps(char, ensure_ascii=False)}: {json.dumps(b64)}"
+        for char, b64 in gifs.items() if b64
+    )
+    return "\n".join([
+        '<script type="application/json" id="gif-data">',
+        "{",
+        entries,
+        "}",
+        "</script>",
+    ])
+
+
 def build(content: dict, gifs: dict[str, str | None], content_file: str = "") -> str:
     """Assemble the whole self-contained practice page and return it as HTML.
 
     `gifs` maps character -> base64 GIF (or None when rendering failed).
     `content_file` is written onto <body data-content-file> so the "まとめて"
     button can tell the local server which content JSON today's page came from.
+
+    The page is emitted indented and commented, so it can be read (and diffed)
+    as HTML rather than only viewed in a browser.
     """
     day = content.get("date") or date.today().isoformat()
     theme = content.get("theme", "")
     chars = "・".join(entry["char"] for entry in content["kanji"])
 
-    parts = [
-        "<!DOCTYPE html>", '<html lang="ja">', "<head>", '<meta charset="utf-8">',
-        '<meta name="viewport" content="width=device-width, initial-scale=1">',
-        f"<title>漢字練習 {day}</title>", "<style>", CSS, "</style>", "</head>",
-        f'<body data-content-file="{attr_esc(content_file)}">',
-        furigana_toggle_html(),
-        '<div class="page">', '<div class="wrap">', "", "<h1>漢字練習</h1>",
-        f'<p class="sub">{day}　テーマ：<b>{esc(theme)}</b>　'
-        f'({level_summary(content["kanji"])})</p>', "",
-        '<div class="box warm">',
-        f"  <p>今日のテーマ：{esc(theme)}　／　今日の{len(content['kanji'])}字：{chars}</p>",
-        '  <p class="en">まず読み方と単語を確認してから、最後の復習クイズに挑戦してください。</p>',
-        '  <p class="en">※筆順アニメーションは KanjiVG（CC BY-SA 3.0）のデータから作成しています。'
-        '赤ではなく画ごとに色が変わり、数字が何画目かを示します。</p>',
-        '  <p class="en">※左上の「ふりがな」ボタンで、例文とクイズの読みを表示/非表示にできます。</p>',
-        "</div>", "",
-    ]
-
+    sections = []
     for i, entry in enumerate(content["kanji"], 1):
-        parts.append(kanji_section(i, entry, gifs.get(entry["char"])))
-        parts.append("")
-    parts.append(practice_section(content["kanji"]))
-    parts.append(quiz_section(content["quiz"]))
-    parts.append(f'<p class="foot">JLPT漢字練習 ／ {day} ／ '
-                 f'筆順データ：KanjiVG (CC BY-SA 3.0)</p>')
+        level = entry.get("level", "N3").upper()
+        sections += [banner(f'{i}. {entry["char"]}（{level}）'),
+                     kanji_section(i, entry, bool(gifs.get(entry["char"]))), ""]
+    sections += [banner("書き取り練習"), practice_section(content["kanji"]), ""]
+    sections += [banner("復習クイズ"), quiz_section(content["quiz"]), ""]
 
-    # gifdec.js is inlined so the page plays its GIFs on a canvas (speed
-    # control, replay, stop-at-end) instead of as a plain looping <img>.
-    parts.append(PLAYER_JS % (HERE / "gifdec.js").read_text(encoding="utf-8"))
+    wrap = "\n".join([
+        "<h1>漢字練習</h1>",
+        f'<p class="sub">{day}　テーマ：<b>{esc(theme)}</b>　'
+        f'({level_summary(content["kanji"])})</p>',
+        "",
+        intro_box_html(theme, len(content["kanji"]), chars),
+        "",
+        "\n".join(sections).rstrip(),
+        "",
+        f'<p class="foot">JLPT漢字練習 ／ {day} ／ 筆順データ：KanjiVG (CC BY-SA 3.0)</p>',
+    ])
 
-    # The sidebar closes the .wrap/.page divs; the fixed buttons sit outside.
-    parts += ["</div>", chatbox_html(), "</div>", summarize_button_html()]
-    parts.append(CHAT_JS)
-    parts.append(SUMMARIZE_JS)
-    parts.append(FURIGANA_JS)
-    parts += ["</body>", "</html>"]
-    return "\n".join(parts)
+    page = "\n".join([
+        banner("本文"),
+        '<div class="wrap">',
+        indent(wrap, 1),
+        "</div>",
+        "",
+        banner("チャット（サイドバー）"),
+        chatbox_html(),
+    ])
+
+    return "\n".join([
+        "<!DOCTYPE html>",
+        '<html lang="ja">',
+        "<head>",
+        '<meta charset="utf-8">',
+        '<meta name="viewport" content="width=device-width, initial-scale=1">',
+        f"<title>漢字練習 {day}</title>",
+        "<style>",
+        CSS.strip("\n"),
+        "</style>",
+        "</head>",
+        "",
+        f'<body data-content-file="{attr_esc(content_file)}">',
+        "",
+        banner("ふりがなトグル（左上に固定）"),
+        furigana_toggle_html(),
+        "",
+        '<div class="page">',
+        indent(page, 1),
+        "</div>",
+        "",
+        banner("まとめてボタン（右下に固定）"),
+        summarize_button_html(),
+        "",
+        banner("筆順GIFのデータ（本文を読みやすく保つため、まとめてここに置いている）"),
+        gif_data_html(gifs),
+        "",
+        banner("スクリプト"),
+        # gifdec.js is inlined so the page plays its GIFs on a canvas (speed
+        # control, replay, stop-at-end) instead of as a plain looping <img>.
+        PLAYER_JS % (HERE / "gifdec.js").read_text(encoding="utf-8"),
+        CHAT_JS,
+        CHAT_RESIZE_JS,
+        SUMMARIZE_JS,
+        FURIGANA_JS,
+        "</body>",
+        "</html>",
+        "",
+    ])
 
 
 def content_json_path(out: Path) -> Path:

@@ -140,13 +140,20 @@ conda run -n kanji python ~/.claude/skills/kanji-practice/build_page.py /tmp/kan
 これが自動でやること:
 
 - KanjiVGのSVGを取得し、`kanji_gif.py` で筆順GIFを作る（`~/Documents/Claude-JP/漢字/gif/` にキャッシュ）
-- GIFをbase64でHTMLに埋め込む（オフラインでも動く）
+- GIFをbase64でHTMLに埋め込む（オフラインでも動く）。ただし本文の中には入れず、
+  ページ末尾の `<script type="application/json" id="gif-data">` に字ごとにまとめる
+  （本文のHTMLを人が読める状態に保つため）。`.player[data-gif]` がそれを読んで canvas に描く。
 - 解答は必ず `<details>` の中に入れる（`open` 属性なし）
+- 見出しごとの節（各漢字・書き取り練習・復習クイズ）は `<details class="sec" open>` で包む
+  （`collapsible()`）。既定は開いた状態で、青い見出しをクリックするとたためる。
+- 生成するHTMLは人が読める形で書き出す：入れ子ごとに半角スペース2つでインデントし、
+  節の頭に `<!-- ===== … ===== -->` のコメントを置く（`indent()` / `banner()`）
 - クイズの入力欄・答え合わせ、書き取り練習のマス目、GIFの速さスライダーと「もう一度見る」を組み込む
 - ページ右側に、テーマに関係なく何でも質問できるチャットのサイドバーを組み込む（`chatbox_html()`）。
   ローカルの質問サーバー（`ask_server.py`、`http://127.0.0.1:8765`、launchd常駐）に毎回fetchし、
   `claude -p --resume` でそのページを開いている間は会話が続く。サーバーに繋がらない場合だけ、
   質問文をクリップボードにコピーするフォールバックになる。
+  チャット欄は左端のつまみをドラッグするか「⤢」ボタンで広げられ、幅はlocalStorageに残る。
 - 右下に「まとめて」ボタンを組み込む（`summarize_button_html()`）。押すと、今日のcontent JSON・
   クイズの入力欄の解答・チャットの会話をローカルサーバー（`/summarize`）に送り、Claudeが
   `~/Documents/Claude-JP/漢字/まとめ_<date>.html` を**別ファイルとして**書く

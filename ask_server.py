@@ -74,23 +74,64 @@ def run_claude(prompt: str, allowed_tools: str, timeout: int,
         return proc, None
 
 
+def summary_section(number: int, title: str, note: str = "") -> str:
+    """One foldable まとめ section, matching the practice page's markup.
+
+    Same `details.sec` pattern build_page.collapsible() emits: open to start
+    with, the <h2> itself acting as the click target.
+    """
+    lines = [f"<!-- ===== {number}. {title} ===== -->"]
+    if note:
+        lines.append(f"<!-- {note} -->")
+    lines += [
+        '<details class="sec" open>',
+        f"  <summary><h2>{number}. {title}</h2></summary>",
+        '  <div class="sec-body">',
+        "    (ここに内容)",
+        "  </div>",
+        "</details>",
+    ]
+    return build_page.indent("\n".join(lines), 2)
+
+
 def summary_skeleton(day: str) -> str:
     """The HTML shell the model fills in, so every まとめ page looks the same
-    as that day's 漢字練習 page (same CSS, same section order)."""
-    return (
-        "<!DOCTYPE html>\n<html lang=\"ja\">\n<head>\n<meta charset=\"UTF-8\">\n"
-        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
-        f"<title>今日の振り返り {day}</title>\n<style>\n{build_page.CSS}\n</style>\n</head>\n<body>\n"
-        "<div class=\"page\"><div class=\"wrap\">\n"
-        "<h1>今日の振り返り</h1>\n"
-        f"<p class=\"sub\">{day}　テーマ：<b>(ここにテーマ)</b></p>\n"
-        "<div class=\"box warm\">(ここに今日の一言まとめ)</div>\n"
-        "<h2>1. 今日学んだ漢字の要点</h2>\n(ここに内容)\n"
-        "<h2>2. クイズの結果</h2>\n(ここに内容)\n"
-        "<h2>3. チャットから追加で学んだこと</h2>\n"
-        "(該当する知識があるときだけ。単語と意味・読みを短く列挙する。なければこの見出しごと省略)\n"
-        "</div></div>\n</body>\n</html>"
-    )
+    as that day's 漢字練習 page (same CSS, same section order, same indented
+    and commented layout)."""
+    return "\n".join([
+        "<!DOCTYPE html>",
+        '<html lang="ja">',
+        "<head>",
+        '<meta charset="UTF-8">',
+        '<meta name="viewport" content="width=device-width, initial-scale=1">',
+        f"<title>今日の振り返り {day}</title>",
+        "<style>",
+        build_page.CSS.strip("\n"),
+        "</style>",
+        "</head>",
+        "",
+        "<body>",
+        "",
+        '<div class="page">',
+        '  <div class="wrap">',
+        "    <h1>今日の振り返り</h1>",
+        f'    <p class="sub">{day}　テーマ：<b>(ここにテーマ)</b></p>',
+        "",
+        '    <div class="box warm">(ここに今日の一言まとめ)</div>',
+        "",
+        summary_section(1, "今日学んだ漢字の要点"),
+        "",
+        summary_section(2, "クイズの結果"),
+        "",
+        summary_section(3, "チャットから追加で学んだこと",
+                        "該当する知識があるときだけ。単語と意味・読みを短く列挙する。"
+                        "なければこの節ごと省略"),
+        "  </div>",
+        "</div>",
+        "",
+        "</body>",
+        "</html>",
+    ])
 
 
 def summary_prompt(content_file: str, summary_path: str, day: str,
@@ -131,7 +172,12 @@ def summary_prompt(content_file: str, summary_path: str, day: str,
         "そのために、次のHTML骨格をそのまま使い、<style>の中身はこのCSSをそのまま丸ごとコピーして"
         "埋め込んでください（変更しない）。(ここに内容)の部分だけ、実際のまとめ内容"
         "（見出し・段落・<ul>や<table>を適宜使う）に置き換えてください：\n\n"
-        f"```html\n{summary_skeleton(day)}\n```"
+        f"```html\n{summary_skeleton(day)}\n```\n\n"
+        "**書き出すHTMLは人が読める形にしてください。** 具体的には、骨格のインデント"
+        "（入れ子ごとに半角スペース2つ）とセクションのコメントをそのまま保ち、追加する内容にも"
+        "同じインデントを付ける。1行にタグを詰め込まず、<tr>や<li>は1行に1つずつ書く。"
+        "各セクションは骨格どおり <details class=\"sec\" open> のまま残し（最初は開いた状態で、"
+        "見出しをクリックするとたためる）、その中の <div class=\"sec-body\"> に内容を入れてください。"
     )
 
 
