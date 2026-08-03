@@ -108,7 +108,8 @@ Pedro（JLPT学習者）向けの毎日の漢字練習HTMLを作る。文章は�
       "q": "この<ruby>ホテル<rt></rt></ruby>の<b><ruby>宿泊<rt>しゅくはく</rt></ruby></b>料金は<ruby>一人<rt>ひとり</rt></ruby><ruby>八千円<rt>はっせんえん</rt></ruby>です。",
       "a": "しゅくはく",
       "alt": ["しゅくばく"],
-      "note": "音読みの熟語です。訓読みの「泊まる」は「とまる」。"
+      "note": "音読みの熟語です。訓読みの「泊まる」は「とまる」。",
+      "char": "泊"
     }
   ]
 }
@@ -128,6 +129,10 @@ Pedro（JLPT学習者）向けの毎日の漢字練習HTMLを作る。文章は�
   `<ruby>宿<rt>しゅく</rt></ruby><ruby>泊<rt>はく</rt></ruby>`ではない）。
 - `strokes` は必ず正しい画数を入れる（書き取り練習のラベルとGIFの説明に使う）。
 - `quiz` は**約20問**（10字 × 音読み1問・訓読み1問が目安）。読み方を答える形式。`a` はひらがな。`alt` にはよくある間違い（あれば）。`note` に音読み/訓読みの短い説明。
+- `quiz` の各問には `char`（その問題が問うている字）を必ず入れる。字ごとの正誤を
+  `kanji_history.json` に記録し、金曜の復習ページを間違えた字から並べるのに使う。
+  省略した場合は `<b>` で囲んだ語から推測するが、確実ではないので書くこと。
+- `note` に `"` を書いても壊れないが（`js_str()` でエスケープされる）、日本語の引用は「」を使う。
 - 各字について、音読みの熟語を使った問題と、訓読みの語を使った問題を最低1問ずつ入れる（両方の読み方が練習できるように）。音読み・訓読みが片方しかない字は、その字から2問（違う単語）出す。
 - クイズの問題は、その日の単語リストや例文から出す。同じ字の2問が単語リストの並び順で連続しないよう、字ごとに散らして並べる（同じ字の問題が続くと答えを覚えてしまうため）。
 
@@ -154,6 +159,10 @@ conda run -n kanji python ~/.claude/skills/kanji-practice/build_page.py /tmp/kan
   `claude -p --resume` でそのページを開いている間は会話が続く。サーバーに繋がらない場合だけ、
   質問文をクリップボードにコピーするフォールバックになる。
   チャット欄は左端のつまみをドラッグするか「⤢」ボタンで広げられ、幅はlocalStorageに残る。
+- クイズの入力途中の答えとチャットの会話をlocalStorageに保存する（`STORE_JS`）。
+  どちらもDOMの中にしか無く、まとめ機能もそこから読むので、保存しないと
+  リロードやタブを閉じた時点でその日の記録がまるごと消えてしまうため。
+  保存先はページごと（`data-page-id` = `<kind>:<date>`）に分ける。
 - 右下に「まとめて」ボタンを組み込む（`summarize_button_html()`）。押すと、今日のcontent JSON・
   クイズの入力欄の解答・チャットの会話をローカルサーバー（`/summarize`）に送り、Claudeが
   `~/Documents/Claude-JP/漢字/まとめ_<date>.html` を**別ファイルとして**書く
@@ -161,6 +170,11 @@ conda run -n kanji python ~/.claude/skills/kanji-practice/build_page.py /tmp/kan
 - 内容JSONのコピーを `~/Documents/Claude-JP/漢字/content_<date>.json` に自動保存し、
   `kanji_history.json` に今日の字・テーマを自動追記する（履歴の更新はスクリプトが自動でやるので、
   手作業でこのファイルを編集する必要はない）
+- 溜まっているクイズの成績を `kanji_history.json` に取り込む（`ingest_quiz_results()`）。
+  「まとめて」を押したときの正誤は `ask_server.py` がスキルフォルダの `.quiz_results/<date>.json`
+  に置く。ask_serverはlaunchd常駐で `~/Documents/Claude-JP` に書き込めない（TCC）ため、
+  履歴へ書くのは毎朝のこのビルドの役目。取り込んだファイルは二重計上を防ぐため消す。
+  記録は字ごとの `{"asked": n, "wrong": n, "last": "<date>"}`。
 
 出力先は `~/Documents/Claude-JP/漢字/漢字練習_<date>.html`。
 
@@ -191,6 +205,21 @@ conda run -n kanji python ~/.claude/skills/kanji-practice/build_review.py
 各日の `content_<date>.json` を読み込んで、字（重複除去）とクイズを全部まとめた1ページを
 `~/Documents/Claude-JP/漢字/復習_<date>.html` に作る。今週分の記録がなければ何も作らずに終わる
 （エラーではない）。
+
+字とクイズは**習った順ではなく、クイズで間違えた回数が多い順**に並ぶ（`quiz_priority()`）。
+一度も出題されていない字は、全問正解の字より前・取りこぼしのある字より後ろに入る。
+成績がまだ無い週は習った順のまま。並び順の理由はページ冒頭の箱に1行で書かれる。
+
+### 7.5 変更したら確認する
+
+`build_page.py` を触ったら、コミット前にスモークテストを走らせる（GIFもネットもconda環境も不要）：
+
+```bash
+python3 ~/.claude/skills/kanji-practice/test_build_page.py
+```
+
+ページ内の `<script>` が壊れても見た目は正常なまま採点だけ止まる、という失敗の仕方をするので、
+テストは埋め込んだJSのデータを読み戻して検査する。
 
 ### 8. 報告する
 

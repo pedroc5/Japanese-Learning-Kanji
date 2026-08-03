@@ -16,6 +16,7 @@ import argparse
 import base64
 import html
 import json
+import re
 import subprocess
 import sys
 from datetime import date
@@ -26,6 +27,13 @@ DEFAULT_MAKER = HERE / "kanji_gif.py"
 DEFAULT_SVG_CACHE = HERE / ".kanjivg_cache"
 KVG_RAW = "https://raw.githubusercontent.com/KanjiVG/kanjivg/master/kanji/{cp}.svg"
 DEFAULT_HISTORY = Path.home() / "Documents" / "Claude-JP" / "漢字" / "kanji_history.json"
+
+# Quiz results dropped here by ask_server.py when まとめて is pressed, and folded
+# into kanji_history.json by the next daily build. They take this detour because
+# ask_server.py runs under launchd without a Files-and-Folders grant for
+# ~/Documents/Claude-JP and cannot write the history file itself (see the long
+# note in ask_server._handle_summarize); the skill folder it can always write.
+QUIZ_RESULTS_DIR = HERE / ".quiz_results"
 
 
 # --------------------------------------------------------------------------- #
@@ -344,15 +352,43 @@ CHAT_RESIZE_JS = """
 """
 
 
+STORE_JS = """
+<script>
+/* ページごとの下書き保存。クイズの答えとチャットの会話はDOMの中にしか無く、まとめ機能も
+   そこから読むので、保存しないとリロードやタブを閉じた時点でその日の記録がまるごと消える。
+   保存先はページごと（data-page-id）に分けるので、日付が違えば混ざらない。
+   このブロックは本文より前に置く必要がある — クイズのスクリプトが本文の中で使うため。 */
+(function(){
+  var id = document.body.getAttribute("data-page-id") || location.pathname;
+  var PREFIX = "kanji:" + id + ":";
+  window.__kanjiStore = {
+    load: function(key, fallback){
+      try {
+        var raw = localStorage.getItem(PREFIX + key);
+        return raw === null ? fallback : JSON.parse(raw);
+      } catch (e) { return fallback; }
+    },
+    save: function(key, value){
+      try { localStorage.setItem(PREFIX + key, JSON.stringify(value)); } catch (e) {}
+    }
+  };
+})();
+</script>
+"""
+
+
 CHAT_JS = """
 <script>
 /* サイドバーのチャット：ローカルの会話サーバー（127.0.0.1:8765）に毎回fetchし、Claudeの
-   答えをその場のログに追加していく。conversation_idはページを開くたびに新しく作り、
-   サーバー側でclaude -p --resumeに使うことで、同じページを開いている間は会話が続く。
+   答えをその場のログに追加していく。conversation_idはページごとに作って保存し、
+   サーバー側でclaude -p --resumeに使うことで、リロードしても会話が続く。
    サーバーに繋がらない場合は、質問文をクリップボードにコピーするフォールバックに切り替える。 */
 (function(){
   var ASK_URL = "http://127.0.0.1:8765/ask";
-  var convId = "c" + Date.now().toString(36) + Math.random().toString(36).slice(2);
+  var store = window.__kanjiStore;
+  var convId = (store && store.load("conv", "")) ||
+               ("c" + Date.now().toString(36) + Math.random().toString(36).slice(2));
+  if (store) store.save("conv", convId);
 
   var log = document.getElementById("chatlog");
   var ta = document.getElementById("chatta");
@@ -372,6 +408,21 @@ CHAT_JS = """
     log.scrollTop = log.scrollHeight;
     return div;
   }
+
+  /* ログを {who, text} の配列にする。保存にも、まとめ機能が会話を送るのにも使う
+     （SUMMARIZE_JS からは window.__chatSnapshot として呼ぶ）。 */
+  function chatSnapshot(){
+    return Array.prototype.map.call(log.querySelectorAll(".chatmsg"), function(el){
+      var whoLabel = el.querySelector(".who");
+      var text = el.textContent;
+      if (whoLabel) text = text.slice(whoLabel.textContent.length);
+      return {who: el.classList.contains("you") ? "you" : "bot", text: text.trim()};
+    }).filter(function(m){ return m.text && m.text !== "…"; });
+  }
+  window.__chatSnapshot = chatSnapshot;
+  function persistChat(){ if (store) store.save("chat", chatSnapshot()); }
+
+  if (store) store.load("chat", []).forEach(function(m){ addMsg(m.who, m.text); });
 
   function copyText(text){
     if (navigator.clipboard && navigator.clipboard.writeText) {
@@ -394,6 +445,7 @@ CHAT_JS = """
     if (!q) { if (msg) msg.textContent = "質問を書いてから押してください。"; return; }
 
     addMsg("you", q);
+    persistChat();            // 答えを待っている間に閉じても質問は残る
     ta.value = "";
     ta.focus();
     btn.disabled = true;
@@ -411,9 +463,11 @@ CHAT_JS = """
       btn.disabled = false;
       if (msg) msg.textContent = "";
       thinking.lastChild.textContent = data.error || data.answer || "(応答なし)";
+      persistChat();
     }).catch(function(){
       btn.disabled = false;
       thinking.remove();
+      persistChat();
       copyText(q).then(function(){
         if (msg) msg.textContent = "質問サーバーに繋がりませんでした。質問をコピーしたので、"
           + "ターミナルのClaude Codeに貼り付けてください。";
@@ -480,7 +534,9 @@ SUMMARIZE_JS = """
         var gn = normReading(given);
         var verdict = !gn ? "未回答"
           : (k.ok.indexOf(gn) >= 0 ? "正解" : (k.alt.indexOf(gn) >= 0 ? "惜しい" : "不正解"));
-        return {q: lis[i] ? questionText(lis[i]) : "", given: given, verdict: verdict};
+        // char は「どの字の問題か」。サーバー側が字ごとの成績として記録する。
+        return {q: lis[i] ? questionText(lis[i]) : "", given: given,
+                verdict: verdict, char: k.char || ""};
       }
     );
   }
@@ -488,16 +544,9 @@ SUMMARIZE_JS = """
   btn.addEventListener("click", function(){
     if (btn.disabled) return;
     var contentFile = document.body.getAttribute("data-content-file") || "";
+    var day = document.body.getAttribute("data-day") || "";
     var quizResults = gradeQuiz();
-    var chat = Array.prototype.map.call(
-      document.querySelectorAll("#chatlog .chatmsg"), function(el){
-        var who = el.classList.contains("you") ? "you" : "bot";
-        var whoLabel = el.querySelector(".who");
-        var text = el.textContent;
-        if (whoLabel) text = text.slice(whoLabel.textContent.length);
-        return {who: who, text: text.trim()};
-      }
-    ).filter(function(m){ return m.text && m.text !== "…"; });
+    var chat = window.__chatSnapshot ? window.__chatSnapshot() : [];
 
     btn.disabled = true;
     if (msg) msg.textContent = "まとめを作成中…（数十秒かかります）";
@@ -505,7 +554,8 @@ SUMMARIZE_JS = """
     fetch(SUMMARIZE_URL, {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({content_file: contentFile, quiz_results: quizResults, chat: chat})
+      body: JSON.stringify({content_file: contentFile, day: day,
+                            quiz_results: quizResults, chat: chat})
     }).then(function(r){ return r.json().then(function(d){ return {ok: r.ok, data: d}; }); })
       .then(function(res){
         btn.disabled = false;
@@ -599,6 +649,69 @@ def update_history(
     return dupes
 
 
+def record_quiz_results(history: dict, results: list[dict], day: str) -> int:
+    """Fold one day's quiz verdicts into the per-kanji record. Returns kanji touched.
+
+    Each result is {"char": kanji, "verdict": 正解/惜しい/不正解/未回答}. Only
+    attempted questions count: 未回答 says nothing about whether the reading is
+    known, and counting it as a miss would push every skipped question to the
+    front of the review. 惜しい counts as a miss — a near-hit is still a reading
+    Pedro hasn't got yet.
+
+    Kanji with no history entry (a character that never appeared in a daily
+    page) are skipped rather than invented, so the file stays a record of what
+    was actually taught.
+    """
+    touched = 0
+    for result in results:
+        char = result.get("char", "")
+        verdict = result.get("verdict", "")
+        entry = history.get("kanji", {}).get(char)
+        if not char or not entry or verdict not in ("正解", "惜しい", "不正解"):
+            continue
+        stats = entry.setdefault("quiz", {"asked": 0, "wrong": 0, "last": ""})
+        stats["asked"] += 1
+        if verdict != "正解":
+            stats["wrong"] += 1
+        stats["last"] = day
+        touched += 1
+    return touched
+
+
+def ingest_quiz_results(history: dict, results_dir: Path = QUIZ_RESULTS_DIR) -> int:
+    """Apply every pending quiz-result file to `history`, then delete it.
+
+    Files are consumed rather than kept so a re-run can't double-count a day.
+    A file that fails to parse is left in place and reported, so a bug here
+    doesn't silently throw away the record.
+    """
+    if not results_dir.exists():
+        return 0
+    applied = 0
+    for path in sorted(results_dir.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            applied += record_quiz_results(history, payload.get("results", []),
+                                           payload.get("date", path.stem))
+        except Exception as e:                       # noqa: BLE001
+            print(f"  ! {path.name} を読めませんでした（残しておきます） — {e}", file=sys.stderr)
+            continue
+        path.unlink()
+    return applied
+
+
+def quiz_priority(history: dict, char: str) -> tuple[int, float]:
+    """Sort key for review order: most-missed first, then worst hit rate.
+
+    Kanji never quizzed sort after anything with a miss but before anything
+    answered correctly every time — they're unproven rather than known.
+    """
+    stats = history.get("kanji", {}).get(char, {}).get("quiz")
+    if not stats or not stats.get("asked"):
+        return (0, -0.5)     # 0点の「全問正解」(0, 0.0) より前、取りこぼしより後ろ
+    return (-stats["wrong"], -stats["wrong"] / stats["asked"])
+
+
 # --------------------------------------------------------------------------- #
 # Stroke-order GIFs
 # --------------------------------------------------------------------------- #
@@ -672,6 +785,18 @@ def esc(s: str) -> str:
 def attr_esc(s: str) -> str:
     """Escape text destined for an HTML attribute value."""
     return html.escape(str(s), quote=True)
+
+
+def js_str(value) -> str:
+    """A JS literal for `value`, safe to drop into an inline <script>.
+
+    json.dumps handles the quoting and backslashes — which plain %s did not:
+    a single " in a quiz note used to produce exp:""雷"は…" and take the whole
+    quiz script down with it (no 答え合わせ, and window.__quizKey never set, so
+    まとめ then graded every question as unanswered). The extra "</" guard stops
+    a closing tag inside the data from ending the <script> element early.
+    """
+    return json.dumps(value, ensure_ascii=False).replace("</", "<\\/")
 
 
 def indent(block: str, level: int) -> str:
@@ -762,11 +887,16 @@ def furigana_toggle_html() -> str:
     ])
 
 
-def intro_box_html(theme: str, count: int, chars: str) -> str:
-    """The orange "how to use this page" box under the title."""
+def intro_box_html(theme: str, count: int, chars: str, note: str = "") -> str:
+    """The orange "how to use this page" box under the title.
+
+    `note` is an optional page-specific line — the weekly review uses it to say
+    that the kanji are ordered by what was missed.
+    """
     return "\n".join([
         '<div class="box warm">',
         f"  <p>今日のテーマ：{esc(theme)}　／　今日の{count}字：{chars}</p>",
+        *([f'  <p class="en"><b>{esc(note)}</b></p>'] if note else []),
         '  <p class="en">まず読み方と単語を確認してから、最後の復習クイズに挑戦してください。</p>',
         '  <p class="en">※筆順アニメーションは KanjiVG（CC BY-SA 3.0）のデータから作成しています。'
         "赤ではなく画ごとに色が変わり、数字が何画目かを示します。</p>",
@@ -945,13 +1075,42 @@ def practice_section(kanji: list[dict]) -> str:
     return collapsible("<h2>書き取り練習(マウス・指で書いてみましょう)</h2>", body)
 
 
-def quiz_section(quiz: list[dict]) -> str:
+def quiz_chars(quiz: list[dict], kanji: list[dict]) -> list[str]:
+    """Which kanji each quiz question is really about, one per question.
+
+    Prefers an explicit "char" on the entry (see SKILL.md). Content files
+    written before that field existed fall back to reading the question's
+    bolded target word — every question bolds the word it asks about — and
+    matching it against today's set. Returns "" when neither works, which
+    only costs that question its per-kanji score.
+    """
+    day_chars = [entry["char"] for entry in kanji]
+    resolved = []
+    for question in quiz:
+        char = question.get("char", "")
+        if not char:
+            bolded = "".join(re.findall(r"<b>(.*?)</b>", question.get("q", ""), re.S))
+            target = re.sub(r"<rt>.*?</rt>", "", bolded)      # ふりがなは字ではない
+            target = re.sub(r"<[^>]+>", "", target)
+            char = next((c for c in day_chars if c in target), "")
+        resolved.append(char)
+    return resolved
+
+
+def quiz_section(quiz: list[dict], chars: list[str]) -> str:
     """The review quiz: input per question, a collapsible answer list, and the
     answer key as JS data for the in-page "answer check" button.
 
     Each quiz entry is {"q": question HTML, "a": answer, "alt": [near misses],
-    "note": explanation}. Question text is left unescaped because it carries
-    <ruby> markup for the furigana toggle.
+    "note": explanation, "char": the kanji it tests}. Question text is left
+    unescaped because it carries <ruby> markup for the furigana toggle.
+
+    `chars` is the per-question kanji from quiz_chars(); it rides along in the
+    answer key so the browser can report which character each result belongs
+    to when まとめて is pressed.
+
+    The key is emitted as strict JSON (quoted keys, js_str values) so it is
+    both valid JS and parseable by the test suite.
 
     Built with %-formatting rather than an f-string: the JS below is full of
     literal braces that an f-string would need doubled.
@@ -965,8 +1124,12 @@ def quiz_section(quiz: list[dict]) -> str:
         note = question.get("note", "")
         answer_items.append(
             f'    <li>{esc(question["a"])}{("（" + esc(note) + "）") if note else ""}</li>')
-        alts = json.dumps(question.get("alt", []), ensure_ascii=False)
-        answer_key.append('    {ok:["%s"], alt:%s, exp:"%s"}' % (question["a"], alts, esc(note)))
+        answer_key.append('    {"ok": %s, "alt": %s, "exp": %s, "char": %s}' % (
+            js_str([question["a"]]),
+            js_str(question.get("alt", [])),
+            js_str(esc(note)),                       # innerHTML に入るのでHTMLエスケープしてから
+            js_str(chars[i] if i < len(chars) else ""),
+        ))
     body = """<p class="en">下の欄に入力して、「答え合わせ」ボタンを押すと、正しいか正しくないかを説明します。</p>
 
 <ol id="quiz">
@@ -997,6 +1160,20 @@ def quiz_section(quiz: list[dict]) -> str:
       .replace(/[ァ-ヶ]/g, function(c){return String.fromCharCode(c.charCodeAt(0)-0x60);})
       .replace(/[\\s　・ー]/g,"");
   }
+
+  // 入力中の答えを保存し、開き直したときに書き戻す。まとめ機能は入力欄をそのまま
+  // 読んで採点するので、保存しないとリロードした時点でその日の記録ごと消える。
+  var store = window.__kanjiStore;
+  var inputs = document.querySelectorAll("input.ans");
+  if (store) {
+    var saved = store.load("quiz", []);
+    inputs.forEach(function(inp, i){ if (saved[i]) inp.value = saved[i]; });
+    var persist = function(){
+      store.save("quiz", Array.prototype.map.call(inputs, function(i){ return i.value; }));
+    };
+    inputs.forEach(function(inp){ inp.addEventListener("input", persist); });
+  }
+
   document.getElementById("check").addEventListener("click", function(){
     var n=0;
     data.forEach(function(d,i){
@@ -1013,6 +1190,8 @@ def quiz_section(quiz: list[dict]) -> str:
   document.getElementById("reset").addEventListener("click", function(){
     document.querySelectorAll("input.ans").forEach(function(i){i.value="";});
     document.querySelectorAll("span.res").forEach(function(s){s.innerHTML="";});
+    document.getElementById("score").innerHTML="";
+    if (store) store.save("quiz", []);
   });
 })();
 </script>""" % ("\n".join(question_items), "\n".join(answer_items), ",\n".join(answer_key))
@@ -1056,12 +1235,16 @@ def gif_data_html(gifs: dict[str, str | None]) -> str:
     ])
 
 
-def build(content: dict, gifs: dict[str, str | None], content_file: str = "") -> str:
+def build(content: dict, gifs: dict[str, str | None], content_file: str = "",
+          page_id: str = "") -> str:
     """Assemble the whole self-contained practice page and return it as HTML.
 
     `gifs` maps character -> base64 GIF (or None when rendering failed).
     `content_file` is written onto <body data-content-file> so the "まとめて"
     button can tell the local server which content JSON today's page came from.
+    `page_id` namespaces the page's saved quiz answers and chat log; it has to
+    separate a day's practice page from that day's review page, which would
+    otherwise share a date and overwrite each other's drafts.
 
     The page is emitted indented and commented, so it can be read (and diffed)
     as HTML rather than only viewed in a browser.
@@ -1076,14 +1259,16 @@ def build(content: dict, gifs: dict[str, str | None], content_file: str = "") ->
         sections += [banner(f'{i}. {entry["char"]}（{level}）'),
                      kanji_section(i, entry, bool(gifs.get(entry["char"]))), ""]
     sections += [banner("書き取り練習"), practice_section(content["kanji"]), ""]
-    sections += [banner("復習クイズ"), quiz_section(content["quiz"]), ""]
+    sections += [banner("復習クイズ"),
+                 quiz_section(content["quiz"],
+                              quiz_chars(content["quiz"], content["kanji"])), ""]
 
     wrap = "\n".join([
         "<h1>漢字練習</h1>",
         f'<p class="sub">{day}　テーマ：<b>{esc(theme)}</b>　'
         f'({level_summary(content["kanji"])})</p>',
         "",
-        intro_box_html(theme, len(content["kanji"]), chars),
+        intro_box_html(theme, len(content["kanji"]), chars, content.get("note", "")),
         "",
         "\n".join(sections).rstrip(),
         "",
@@ -1112,7 +1297,11 @@ def build(content: dict, gifs: dict[str, str | None], content_file: str = "") ->
         "</style>",
         "</head>",
         "",
-        f'<body data-content-file="{attr_esc(content_file)}">',
+        f'<body data-content-file="{attr_esc(content_file)}" data-day="{attr_esc(day)}"'
+        f' data-page-id="{attr_esc(page_id or day)}">',
+        "",
+        banner("下書き保存（クイズの答え・チャット。本文より前に読み込む必要がある）"),
+        STORE_JS.strip("\n"),
         "",
         banner("ふりがなトグル（左上に固定）"),
         furigana_toggle_html(),
@@ -1214,14 +1403,20 @@ def main() -> int:
 
     out.parent.mkdir(parents=True, exist_ok=True)
     content_out.write_text(json.dumps(content, ensure_ascii=False, indent=2), encoding="utf-8")
-    out.write_text(build(content, gifs, str(content_out)), encoding="utf-8")
+    out.write_text(build(content, gifs, str(content_out), f"{args.kind}:{day}"),
+                   encoding="utf-8")
 
     history = load_history(args.history)
     dupes = update_history(history, content, args.kind, day, str(content_out))
+    # Earlier days' quiz scores are only reachable from here: the chat server
+    # that collects them can't write into ~/Documents/Claude-JP itself.
+    graded = ingest_quiz_results(history)
     save_history(args.history, history)
 
     made = sum(1 for gif in gifs.values() if gif)
     print(f"完了：{out}（GIF {made}/{len(content['kanji'])}）")
+    if graded:
+        print(f"  クイズの成績 {graded} 問分を履歴に記録しました")
     if dupes:
         print(f"警告: 履歴上すでに使用済みの字が含まれています — {'・'.join(dupes)}", file=sys.stderr)
         print("   選定時にkanji_history.jsonを確認し損ねた可能性があります。", file=sys.stderr)

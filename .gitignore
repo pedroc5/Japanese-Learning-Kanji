@@ -3,6 +3,9 @@ __pycache__/
 .kanjivg_cache/
 .claude/settings.local.json
 
+# まとめて を押したときのクイズの成績。次のビルドが履歴に取り込んで消す一時ファイル
+.quiz_results/
+
 # graphify の生成物（知識グラフ・キャッシュ・コスト記録）は作り直せるので追跡しない
 graphify-out/
 

@@ -30,7 +30,11 @@ CWD = Path(__file__).resolve().parent  # スキルフォルダ。.claude/setting
 TIMEOUT = 180
 SUMMARY_TIMEOUT = 240
 
-_sessions: dict[str, str] = {}   # conversation_id (browser-side) -> claude session_id
+# conversation_id (browser-side) -> claude session_id. Grows for the life of the
+# process and is dropped on restart: at a handful of conversations a day that
+# costs nothing, and losing it only means the next question starts a fresh
+# thread instead of resuming. Not worth an eviction policy.
+_sessions: dict[str, str] = {}
 _lock = threading.Lock()
 
 # サイドバーのチャット用の指示。質問文には混ぜず --append-system-prompt で渡すので、
@@ -181,6 +185,31 @@ def summary_prompt(content_file: str, summary_path: str, day: str,
     )
 
 
+def save_quiz_results(day: str, results: list[dict]) -> None:
+    """Leave the day's quiz verdicts where the next build can pick them up.
+
+    kanji_history.json would be the natural home, but it lives in
+    ~/Documents/Claude-JP, which this process cannot write (see the note in
+    _handle_summarize). So the results are dropped in the skill folder and
+    build_page.ingest_quiz_results() folds them into the history on the next
+    daily run, which does have access.
+
+    Best-effort: a failure here must not cost Pedro his まとめ, so it is
+    reported and swallowed.
+    """
+    attempted = [r for r in results if r.get("char") and r.get("verdict") != "未回答"]
+    if not attempted:
+        return
+    try:
+        build_page.QUIZ_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        path = build_page.QUIZ_RESULTS_DIR / f"{day}.json"
+        path.write_text(
+            json.dumps({"date": day, "results": attempted}, ensure_ascii=False, indent=2),
+            encoding="utf-8")
+    except Exception as e:                           # noqa: BLE001
+        print(f"クイズの成績を保存できませんでした: {e}", file=sys.stderr)
+
+
 class Handler(BaseHTTPRequestHandler):
     """Two endpoints, both POST: /ask (sidebar chat) and /summarize (まとめて)."""
 
@@ -295,6 +324,8 @@ class Handler(BaseHTTPRequestHandler):
         name_match = re.match(r"content_(.+)\.json$", Path(content_file).name)
         day = name_match.group(1) if name_match else "today"
         summary_path = str(PurePosixPath(content_file).parent / f"まとめ_{day}.html")
+
+        save_quiz_results(day, quiz_results)
 
         prompt = summary_prompt(content_file, summary_path, day, quiz_results, chat)
 

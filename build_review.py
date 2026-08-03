@@ -106,10 +106,30 @@ def main() -> int:
               "復習ページは作成しませんでした。")
         return 0
 
+    # Any scores collected since the last build have to land in the history
+    # before it's used for ordering, or this week's own results are invisible.
+    graded = build_page.ingest_quiz_results(history)
+
+    # Hardest first: the point of the weekly page is the kanji Pedro actually
+    # missed, not another pass in the order they happened to be taught.
+    merged_kanji.sort(key=lambda entry: build_page.quiz_priority(history, entry["char"]))
+    order = {entry["char"]: i for i, entry in enumerate(merged_kanji)}
+    quiz_chars = build_page.quiz_chars(merged_quiz, merged_kanji)
+    merged_quiz = [question for _, question in sorted(
+        enumerate(merged_quiz),
+        key=lambda pair: (order.get(quiz_chars[pair[0]], len(order)), pair[0]),
+    )]
+
+    missed = [entry["char"] for entry in merged_kanji
+              if build_page.quiz_priority(history, entry["char"])[0] < 0]
+
     theme_str = "・".join(themes) if themes else "今週のまとめ"
     merged_content = {
         "date": args.date,
         "theme": f"今週の復習（{monday.isoformat()}〜{sunday.isoformat()}）：{theme_str}",
+        "note": ("クイズで間違えた字から順に並べています（今週の取りこぼし："
+                 + "・".join(missed) + "）。" if missed else
+                 "クイズの記録がまだないので、習った順に並べています。"),
         "kanji": merged_kanji,
         "quiz": merged_quiz,
     }
@@ -122,7 +142,8 @@ def main() -> int:
 
     out = args.out or (args.history.parent / f"復習_{args.date}.html")
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(build_page.build(merged_content, gifs), encoding="utf-8")
+    out.write_text(build_page.build(merged_content, gifs, page_id=f"review:{args.date}"),
+                   encoding="utf-8")
 
     build_page.update_history(history, merged_content, "review", args.date, str(out))
     build_page.save_history(args.history, history)
@@ -130,6 +151,10 @@ def main() -> int:
     made = sum(1 for gif in gifs.values() if gif)
     print(f"完了：{out}（{len(used_dates)}日分・{len(merged_kanji)}字・"
           f"GIF {made}/{len(merged_kanji)}）")
+    if graded:
+        print(f"  クイズの成績 {graded} 問分を履歴に記録しました")
+    if missed:
+        print(f"  間違えた字を先頭に並べました — {'・'.join(missed)}")
     if failed:
         print(f"警告: GIFを作れなかった字があります — {'・'.join(failed)}", file=sys.stderr)
         return 1
