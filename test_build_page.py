@@ -154,8 +154,8 @@ class BuildPageTest(unittest.TestCase):
         self.assertEqual(parser.stack, [])
 
     def test_every_section_is_foldable_and_open(self):
-        # 2 kanji + 書き取り練習 + 復習クイズ
-        self.assertEqual(self.page.count('<details class="sec" open>'), 4)
+        # 2 kanji（各字に書き取り練習を内蔵） + 復習クイズ
+        self.assertEqual(self.page.count('<details class="sec" open>'), 3)
         self.assertNotIn('<details class="sec">', self.page)
 
     def test_answer_list_stays_collapsed(self):

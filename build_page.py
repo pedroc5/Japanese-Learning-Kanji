@@ -164,7 +164,6 @@ CSS = """
   .spdv{color:var(--navy); font-size:13px; min-width:44px; display:inline-block}
   .grid{display:flex; flex-wrap:wrap; gap:14px; margin-top:12px}
   .cell{position:relative; width:112px}
-  .cell .label{font-size:13px; color:var(--grey); text-align:center; margin-bottom:2px}
   .cell .padres{font-size:11px; line-height:1.4; text-align:center; margin-top:3px; min-height:15px}
   .cell .padres.ok{color:var(--green)}
   .cell .padres.ng{color:var(--accent)}
@@ -310,6 +309,171 @@ STROKE_JS = """
       if (lab) lab.textContent = "×" + speed.toFixed(1);
     };
     start();
+  });
+})();
+</script>
+"""
+
+
+PRACTICE_JS = """
+<script>
+/* 書き取り練習：各字のマスに、押した点を線として記録して描く。
+
+   線は点の列として保存する（ピクセルではなく）。開き直しても消えず、undo・
+   保存・簡易チェックがすべて同じ表現の上で完結する。
+
+   簡易チェックは、このブロックのすぐ上にある筆順SVG（.strokes[data-kanji]）に
+   既に埋め込まれているKanjiVGのパスを読み直して比べるので、別データは要らない。
+*/
+(function(){
+  var SIZE = 112;
+  var store = window.__kanjiStore;
+  var saved = store ? store.load("pads", {}) : {};
+
+  function modelStrokes(char){
+    var svg = document.querySelector('.strokes[data-kanji="' + char + '"]');
+    if (!svg) return null;
+    var vb = svg.viewBox.baseVal;
+    return Array.prototype.map.call(svg.querySelectorAll(".ink path"), function(p){
+      var len = p.getTotalLength();
+      var a = p.getPointAtLength(0), b = p.getPointAtLength(len);
+      return {ax: (a.x - vb.x) / vb.width, ay: (a.y - vb.y) / vb.height,
+              bx: (b.x - vb.x) / vb.width, by: (b.y - vb.y) / vb.height};
+    });
+  }
+
+  function redraw(entry){
+    var ctx = entry.ctx;
+    ctx.clearRect(0, 0, SIZE, SIZE);
+    entry.strokes.forEach(function(stroke){
+      if (stroke.length < 2) return;
+      ctx.beginPath();
+      ctx.moveTo(stroke[0][0], stroke[0][1]);
+      for (var i = 1; i < stroke.length; i++) ctx.lineTo(stroke[i][0], stroke[i][1]);
+      ctx.stroke();
+    });
+  }
+
+  function grade(entry, model){
+    var user = entry.strokes;
+    if (!model || !model.length || !user.length) return {cls: "", text: ""};
+
+    var notes = [];
+    if (user.length !== model.length) {
+      notes.push(model.length + "画のところを" + user.length + "画で書いています");
+    }
+    var n = Math.min(user.length, model.length);
+    for (var i = 0; i < n; i++) {
+      var s = user[i], a = s[0], b = s[s.length - 1];
+      var ux = (b[0] - a[0]) / SIZE, uy = (b[1] - a[1]) / SIZE;
+      var mx = model[i].bx - model[i].ax, my = model[i].by - model[i].ay;
+      var lu = Math.sqrt(ux * ux + uy * uy), lm = Math.sqrt(mx * mx + my * my);
+      if (lu < 0.04 || lm < 0.04) continue;        // 点のような画は向きを判定しない
+      var cos = (ux * mx + uy * my) / (lu * lm);
+      var dx = a[0] / SIZE - model[i].ax, dy = a[1] / SIZE - model[i].ay;
+      if (cos < 0.3) notes.push((i + 1) + "画目の向きが違うようです");
+      else if (Math.sqrt(dx * dx + dy * dy) > 0.28) notes.push((i + 1) + "画目の書き始めの位置");
+      if (notes.length >= 3) break;                // 指摘しすぎない
+    }
+    return notes.length ? {cls: "ng", text: "△ " + notes.join("／") + "。"}
+                        : {cls: "ok", text: "〇 画数も向きも合っています。"};
+  }
+
+  document.querySelectorAll(".practice-block").forEach(function(block){
+    var char = block.dataset.char;
+    var boxes = parseInt(block.dataset.boxes, 10) || 5;
+    var grid = block.querySelector(".grid");
+    var model = modelStrokes(char);
+    var savedBoxes = saved[char] || [];
+    var pads = [], activePad = null, hidden = false;
+
+    function persist(){
+      if (!store) return;
+      saved[char] = pads.map(function(p){ return p.strokes; });
+      store.save("pads", saved);
+    }
+    function pos(cv, e){
+      var r = cv.getBoundingClientRect();
+      return [(e.clientX - r.left) * SIZE / r.width, (e.clientY - r.top) * SIZE / r.height];
+    }
+
+    var _loop = function(boxIndex){
+      var cell = document.createElement("div"); cell.className = "cell";
+      var pad = document.createElement("div"); pad.className = "pad";
+      var mdl = document.createElement("div"); mdl.className = "model"; mdl.textContent = char;
+      var cv = document.createElement("canvas");
+      var dpr = window.devicePixelRatio || 1;
+      cv.width = SIZE * dpr; cv.height = SIZE * dpr;
+      var ctx = cv.getContext("2d"); ctx.scale(dpr, dpr);
+      ctx.lineWidth = 5; ctx.lineCap = "round"; ctx.lineJoin = "round"; ctx.strokeStyle = "#1a1a1a";
+      var res = document.createElement("div"); res.className = "padres";
+      var entry = {pad: pad, ctx: ctx, cv: cv, res: res,
+                   strokes: (savedBoxes[boxIndex] || []).slice()};
+      var drawing = false;
+
+      cv.addEventListener("pointerdown", function(e){
+        drawing = true;
+        // マスの外まで一気に引いても線が切れないように。合成イベントでは
+        // 捕捉できない（有効なpointerIdが無い）ので、失敗しても続行する。
+        try { cv.setPointerCapture(e.pointerId); } catch (err) {}
+        activePad = entry;
+        entry.strokes.push([pos(cv, e)]);
+        res.textContent = ""; res.className = "padres";
+      });
+      cv.addEventListener("pointermove", function(e){
+        if (!drawing) return;
+        entry.strokes[entry.strokes.length - 1].push(pos(cv, e));
+        redraw(entry);
+      });
+      ["pointerup","pointercancel","pointerleave"].forEach(function(t){
+        cv.addEventListener(t, function(){
+          if (!drawing) return;
+          drawing = false;
+          persist();
+        });
+      });
+
+      pad.appendChild(mdl); pad.appendChild(cv);
+      cell.appendChild(pad); cell.appendChild(res);
+      grid.appendChild(cell);
+      pads.push(entry);
+      redraw(entry);                                 // 前回の続きから
+    };
+    for (var b = 0; b < boxes; b++) _loop(b);
+
+    var checkBtn = block.querySelector(".checkPads");
+    var toggleBtn = block.querySelector(".toggleModel");
+    var undoBtn = block.querySelector(".undoStroke");
+    var clearBtn = block.querySelector(".clearAll");
+
+    if (toggleBtn) toggleBtn.addEventListener("click", function(){
+      hidden = !hidden;
+      pads.forEach(function(p){ p.pad.classList.toggle("hide", hidden); });
+      this.textContent = hidden ? "お手本を表示" : "お手本を隠す";
+    });
+    if (undoBtn) undoBtn.addEventListener("click", function(){
+      if (!activePad || !activePad.strokes.length) return;
+      activePad.strokes.pop();
+      redraw(activePad);
+      persist();
+    });
+    if (clearBtn) clearBtn.addEventListener("click", function(){
+      pads.forEach(function(p){
+        p.strokes.length = 0; redraw(p);
+        p.res.textContent = ""; p.res.className = "padres";
+      });
+      persist();
+    });
+    if (checkBtn) checkBtn.addEventListener("click", function(){
+      var written = 0;
+      pads.forEach(function(p){
+        var verdict = grade(p, model);
+        p.res.textContent = verdict.text;
+        p.res.className = "padres " + verdict.cls;
+        if (p.strokes.length) written++;
+      });
+      if (!written) pads[0].res.textContent = "まずマスに書いてみてください。";
+    });
   });
 })();
 </script>
@@ -996,7 +1160,8 @@ def intro_box_html(theme: str, count: int, chars: str, note: str = "") -> str:
         "赤ではなく画ごとに色が変わり、数字が何画目かを示します。</p>",
         '  <p class="en">※左上の「ふりがな」ボタンで、例文とクイズの読みを表示/非表示にできます。</p>',
         '  <p class="en">※青い見出しをクリックすると、その節をたたんだり開いたりできます。</p>',
-        '  <p class="en">※書き取り練習では「書き順を確認する」で、画数と各画の向きを見てもらえます。</p>',
+        '  <p class="en">※各字の書き取り練習では「書き順を確認する」で、画数と各画の向きを見てもらえます。'
+        "書き順の基本：①上から下へ　②左から右へ　③横画→縦画　④外側の囲み→中身→ふたは最後。</p>",
         '  <p class="en">※チャット欄は左端をドラッグするか「⤢」を押すと広げられます。</p>',
         "</div>",
     ])
@@ -1070,6 +1235,31 @@ def stroke_player_html(char: str, strokes: str, data: dict | None) -> str:
     ])
 
 
+def writing_practice_html(char: str, strokes: str, boxes: int = 5) -> str:
+    """A row of blank tracing boxes for one kanji, dropped right under its stroke animation.
+
+    Only the shell is emitted here — PRACTICE_JS fills in `.grid` at load time,
+    since each canvas needs the live devicePixelRatio to size itself. Its
+    grading reuses the KanjiVG paths already inlined in this same kanji's
+    stroke-order SVG just above (`.strokes[data-kanji]`), so no extra data is
+    needed here beyond the character and its stroke count.
+    """
+    return "\n".join([
+        f'<div class="practice-block" data-char="{attr_esc(char)}"'
+        f' data-strokes="{attr_esc(strokes)}" data-boxes="{boxes}">',
+        '  <p class="en"><b>書き取り練習</b>：うすいお手本をなぞってから、'
+        '「お手本を隠す」を押して書いてみましょう。</p>',
+        '  <div class="grid"></div>',
+        '  <p>',
+        '    <button class="btn checkPads" type="button">書き順を確認する</button>',
+        '    <button class="btn sub2 toggleModel" type="button">お手本を隠す</button>',
+        '    <button class="btn sub2 undoStroke" type="button">一画戻す</button>',
+        '    <button class="btn sub2 clearAll" type="button">全部消す</button>',
+        '  </p>',
+        '</div>',
+    ])
+
+
 def word_table_html(words: list[dict]) -> str:
     """The 単語/読み/意味 table. Entries are {"w": word, "r": reading, "m": meaning}.
 
@@ -1126,200 +1316,14 @@ def kanji_section(i: int, kanji: dict, stroke_data: dict | None) -> str:
     parts.append("")
     parts.append(stroke_player_html(char, kanji.get("strokes", ""), stroke_data))
     parts.append("")
+    parts.append(writing_practice_html(char, kanji.get("strokes", "")))
+    parts.append("")
     parts.append(word_table_html(kanji.get("words", [])))
     parts.append("")
 
     for example in kanji.get("examples", []):
         parts.append(f'<p class="ex">・{example}</p>')  # 例文は <b> や <ruby> を含むので escape しない
     return collapsible(heading, "\n".join(parts).rstrip())
-
-
-def practice_section(kanji: list[dict]) -> str:
-    """The handwriting grid: one canvas per kanji, with a faint model to trace.
-
-    Strokes are kept as point arrays rather than as pixels, which is what lets
-    undo, saving and checking all work off the same representation — the canvas
-    is only ever a redraw of that list.
-
-    The check compares each stroke against the KanjiVG path already embedded in
-    this page's stroke-order SVG, so no extra data is needed here.
-
-    Note this is an f-string, so every literal brace in the JS below is doubled.
-    """
-    # A JS array literal of [character, "N画"] pairs, e.g. ["雷","13画"].
-    items = ", ".join(
-        '["%s","%s画"]' % (entry["char"], entry.get("strokes", "")) for entry in kanji
-    )
-    body = f"""<p class="en">うすいお手本の上をなぞってから、「お手本を隠す」を押して、何も見ないで書いてみてください。
-書いたものは保存されるので、ページを開き直しても消えません。印刷すると、紙のマス目としても使えます。</p>
-
-<p>
-  <button class="btn" id="checkPads">書き順を確認する</button>
-  <button class="btn sub2" id="toggleModel">お手本を隠す</button>
-  <button class="btn sub2" id="undoStroke">一画戻す</button>
-  <button class="btn sub2" id="clearAll">全部消す</button>
-</p>
-
-<div class="grid" id="padGrid"></div>
-
-<div class="box">
-  <p class="en">書き順の基本ルール：①上から下へ　②左から右へ　③横画→縦画　④外側の囲み→中身→最後にふた　⑤左のへんを先に書く。</p>
-  <p class="en">※「書き順を確認する」は、画数と、各画の向き・書き始めの位置をKanjiVGのお手本と
-  くらべる簡易チェックです。形の良し悪しまでは見ていません。</p>
-</div>
-
-<script>
-(function(){{
-  var SIZE = 112;                      // マスの大きさ（CSSピクセル）
-  var list = [{items}];
-  var grid = document.getElementById("padGrid"), pads = [];
-  var store = window.__kanjiStore;
-  var saved = store ? store.load("pads", {{}}) : {{}};
-
-  /* お手本の各画を「始点→終点」に単純化して、0〜1に正規化して返す。
-     筆順SVGがこのページに既にあるので、字形データを別に持つ必要はない。 */
-  function modelStrokes(char){{
-    var svg = document.querySelector('.strokes[data-kanji="' + char + '"]');
-    if (!svg) return null;
-    var vb = svg.viewBox.baseVal;
-    return Array.prototype.map.call(svg.querySelectorAll(".ink path"), function(p){{
-      var len = p.getTotalLength();
-      var a = p.getPointAtLength(0), b = p.getPointAtLength(len);
-      return {{ax: (a.x - vb.x) / vb.width, ay: (a.y - vb.y) / vb.height,
-              bx: (b.x - vb.x) / vb.width, by: (b.y - vb.y) / vb.height}};
-    }});
-  }}
-
-  function redraw(entry){{
-    var ctx = entry.ctx;
-    ctx.clearRect(0, 0, SIZE, SIZE);
-    entry.strokes.forEach(function(stroke){{
-      if (stroke.length < 2) return;
-      ctx.beginPath();
-      ctx.moveTo(stroke[0][0], stroke[0][1]);
-      for (var i = 1; i < stroke.length; i++) ctx.lineTo(stroke[i][0], stroke[i][1]);
-      ctx.stroke();
-    }});
-  }}
-
-  function persist(){{
-    if (!store) return;
-    var out = {{}};
-    pads.forEach(function(p){{ if (p.strokes.length) out[p.char] = p.strokes; }});
-    store.save("pads", out);
-  }}
-
-  function grade(entry){{
-    var model = modelStrokes(entry.char);
-    var user = entry.strokes;
-    if (!model || !model.length) return {{cls: "", text: ""}};
-    if (!user.length) return {{cls: "", text: ""}};
-
-    var notes = [];
-    if (user.length !== model.length) {{
-      notes.push(model.length + "画のところを" + user.length + "画で書いています");
-    }}
-    var n = Math.min(user.length, model.length);
-    for (var i = 0; i < n; i++) {{
-      var s = user[i], a = s[0], b = s[s.length - 1];
-      var ux = (b[0] - a[0]) / SIZE, uy = (b[1] - a[1]) / SIZE;
-      var mx = model[i].bx - model[i].ax, my = model[i].by - model[i].ay;
-      var lu = Math.sqrt(ux * ux + uy * uy), lm = Math.sqrt(mx * mx + my * my);
-      if (lu < 0.04 || lm < 0.04) continue;        // 点のような画は向きを判定しない
-      var cos = (ux * mx + uy * my) / (lu * lm);
-      var dx = a[0] / SIZE - model[i].ax, dy = a[1] / SIZE - model[i].ay;
-      if (cos < 0.3) notes.push((i + 1) + "画目の向きが違うようです");
-      else if (Math.sqrt(dx * dx + dy * dy) > 0.28) notes.push((i + 1) + "画目の書き始めの位置");
-      if (notes.length >= 3) break;                // 指摘しすぎない
-    }}
-    return notes.length ? {{cls: "ng", text: "△ " + notes.join("／") + "。"}}
-                        : {{cls: "ok", text: "〇 画数も向きも合っています。"}};
-  }}
-
-  list.forEach(function(item){{
-    var cell = document.createElement("div"); cell.className = "cell";
-    var lab = document.createElement("div"); lab.className = "label";
-    lab.textContent = item[0] + "（" + item[1] + "）";
-    var pad = document.createElement("div"); pad.className = "pad";
-    var mdl = document.createElement("div"); mdl.className = "model"; mdl.textContent = item[0];
-    var cv = document.createElement("canvas");
-    var dpr = window.devicePixelRatio || 1;
-    cv.width = SIZE * dpr; cv.height = SIZE * dpr;
-    var ctx = cv.getContext("2d"); ctx.scale(dpr, dpr);
-    ctx.lineWidth = 5; ctx.lineCap = "round"; ctx.lineJoin = "round"; ctx.strokeStyle = "#1a1a1a";
-    var res = document.createElement("div"); res.className = "padres";
-    var drawing = false;
-    var entry = {{char: item[0], pad: pad, ctx: ctx, cv: cv, res: res,
-                 strokes: (saved[item[0]] || []).slice()}};
-
-    function pos(e){{
-      var r = cv.getBoundingClientRect();
-      return [(e.clientX - r.left) * SIZE / r.width, (e.clientY - r.top) * SIZE / r.height];
-    }}
-    cv.addEventListener("pointerdown", function(e){{
-      drawing = true;
-      // マスの外まで一気に引いても線が切れないように。合成イベントでは
-      // 捕捉できない（有効なpointerIdが無い）ので、失敗しても続行する。
-      try {{ cv.setPointerCapture(e.pointerId); }} catch (err) {{}}
-      activePad = entry;
-      entry.strokes.push([pos(e)]);
-      res.textContent = ""; res.className = "padres";
-    }});
-    cv.addEventListener("pointermove", function(e){{
-      if (!drawing) return;
-      entry.strokes[entry.strokes.length - 1].push(pos(e));
-      redraw(entry);
-    }});
-    ["pointerup","pointercancel","pointerleave"].forEach(function(t){{
-      cv.addEventListener(t, function(){{
-        if (!drawing) return;
-        drawing = false;
-        persist();
-      }});
-    }});
-
-    pad.appendChild(mdl); pad.appendChild(cv);
-    cell.appendChild(lab); cell.appendChild(pad); cell.appendChild(res);
-    grid.appendChild(cell);
-    pads.push(entry);
-    redraw(entry);                                 // 前回の続きから
-  }});
-
-  var hidden = false;
-  var activePad = null;   // 直前に線を描いたマス（「一画戻す」が対象にする）
-  document.getElementById("toggleModel").addEventListener("click", function(){{
-    hidden = !hidden;
-    pads.forEach(function(p){{ p.pad.classList.toggle("hide", hidden); }});
-    this.textContent = hidden ? "お手本を表示" : "お手本を隠す";
-  }});
-  document.getElementById("undoStroke").addEventListener("click", function(){{
-    if (!activePad || !activePad.strokes.length) return;
-    activePad.strokes.pop();
-    redraw(activePad);
-    persist();
-  }});
-  document.getElementById("clearAll").addEventListener("click", function(){{
-    pads.forEach(function(p){{
-      p.strokes.length = 0; redraw(p);
-      p.res.textContent = ""; p.res.className = "padres";
-    }});
-    persist();
-  }});
-  document.getElementById("checkPads").addEventListener("click", function(){{
-    var written = 0;
-    pads.forEach(function(p){{
-      var verdict = grade(p);
-      p.res.textContent = verdict.text;
-      p.res.className = "padres " + verdict.cls;
-      if (p.strokes.length) written++;
-    }});
-    if (!written) {{
-      pads[0].res.textContent = "まずマスに書いてみてください。";
-    }}
-  }});
-}})();
-</script>"""
-    return collapsible("<h2>書き取り練習(マウス・指で書いてみましょう)</h2>", body)
 
 
 def quiz_chars(quiz: list[dict], kanji: list[dict]) -> list[str]:
@@ -1485,7 +1489,6 @@ def build(content: dict, strokes: dict[str, dict | None], content_file: str = ""
         level = entry.get("level", "N3").upper()
         sections += [banner(f'{i}. {entry["char"]}（{level}）'),
                      kanji_section(i, entry, strokes.get(entry["char"])), ""]
-    sections += [banner("書き取り練習"), practice_section(content["kanji"]), ""]
     sections += [banner("復習クイズ"),
                  quiz_section(content["quiz"],
                               quiz_chars(content["quiz"], content["kanji"])), ""]
@@ -1542,6 +1545,7 @@ def build(content: dict, strokes: dict[str, dict | None], content_file: str = ""
         "",
         banner("スクリプト"),
         STROKE_JS,
+        PRACTICE_JS,
         CHAT_JS,
         CHAT_RESIZE_JS,
         SUMMARIZE_JS,
