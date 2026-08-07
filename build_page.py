@@ -1434,6 +1434,40 @@ def quiz_chars(quiz: list[dict], kanji: list[dict]) -> list[str]:
     return resolved
 
 
+def plain_sentence(text: str) -> str:
+    """A sentence stripped down to what is actually being read: no markup, no
+    furigana, no spacing or closing punctuation. Two sentences that differ only
+    in those come out identical."""
+    text = re.sub(r"<rt>.*?</rt>", "", str(text), flags=re.S)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"\s+", "", text)
+    return text.strip("。．.！!？?、,")
+
+
+def reused_examples(content: dict) -> list[str]:
+    """Quiz questions that are just one of the day's example sentences again.
+
+    The quiz is meant to test the reading in a *new* sentence — a question
+    copied from the 例文 a few lines above only tests whether Pedro remembers
+    the page. Substrings count too, since trimming an example down to its first
+    clause is the same sentence for this purpose.
+
+    Returns the offending question text (stripped) for the warning in main().
+    """
+    examples = [plain_sentence(ex)
+                for entry in content.get("kanji", [])
+                for ex in entry.get("examples", [])]
+    hits = []
+    for question in content.get("quiz", []):
+        sentence = plain_sentence(question.get("q", ""))
+        if len(sentence) < 6:
+            continue
+        if any(sentence == ex or (len(ex) >= 6 and (sentence in ex or ex in sentence))
+               for ex in examples):
+            hits.append(sentence)
+    return hits
+
+
 def quiz_section(quiz: list[dict], chars: list[str]) -> str:
     """The review quiz: input per question, a collapsible answer list, and the
     answer key as JS data for the in-page "answer check" button.
@@ -1729,6 +1763,11 @@ def main() -> int:
     if dupes:
         print(f"警告: 履歴上すでに使用済みの字が含まれています — {'・'.join(dupes)}", file=sys.stderr)
         print("   選定時にkanji_history.jsonを確認し損ねた可能性があります。", file=sys.stderr)
+    recycled = reused_examples(content)
+    if recycled:
+        print(f"警告: 例文の使い回しがクイズに {len(recycled)} 問あります — "
+              f"{'／'.join(recycled[:3])}{' …' if len(recycled) > 3 else ''}", file=sys.stderr)
+        print("   クイズは同じ単語を使った別の文で出してください。", file=sys.stderr)
     if failed:
         print(f"警告: 筆順データを読めなかった字があります — {'・'.join(failed)}", file=sys.stderr)
         print("   ネットワークを確認し、必要なら再実行してください。", file=sys.stderr)

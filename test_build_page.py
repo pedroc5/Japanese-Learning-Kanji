@@ -267,6 +267,31 @@ class WordFuriganaTest(unittest.TestCase):
         self.assertIn("a &lt; b", table)
 
 
+class ExampleReuseTest(unittest.TestCase):
+    """クイズは同じ単語の別の文で出す — 例文の使い回しは警告する。"""
+
+    def content(self, question: str) -> dict:
+        return {
+            "kanji": [{"char": "泊", "examples": [
+                "<ruby>京都<rt>きょうと</rt></ruby>に<b>二泊三日</b>で"
+                "<ruby>旅行<rt>りょこう</rt></ruby>しました。"]}],
+            "quiz": [{"q": question}],
+        }
+
+    def test_the_same_sentence_in_different_markup_is_caught(self):
+        recycled = build_page.reused_examples(
+            self.content("<ruby>京都<rt>きょうと</rt></ruby>に"
+                         "<b><ruby>二泊三日<rt>にはくみっか</rt></ruby></b>で旅行しました"))
+        self.assertEqual(recycled, ["京都に二泊三日で旅行しました"])
+
+    def test_an_example_trimmed_to_its_first_clause_is_caught(self):
+        self.assertTrue(build_page.reused_examples(self.content("京都に二泊三日で旅行")))
+
+    def test_a_new_sentence_with_the_same_word_is_fine(self):
+        self.assertEqual(
+            build_page.reused_examples(self.content("<b>二泊三日</b>の出張から帰ってきた。")), [])
+
+
 class QuizHistoryTest(unittest.TestCase):
     def setUp(self) -> None:
         self.history = {"kanji": {"雷": {"date": "2026-08-02", "level": "N1"},
