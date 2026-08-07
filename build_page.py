@@ -1260,20 +1260,106 @@ def writing_practice_html(char: str, strokes: str, boxes: int = 5) -> str:
     ])
 
 
-def word_table_html(words: list[dict]) -> str:
-    """The 単語/読み/意味 table. Entries are {"w": word, "r": reading, "m": meaning}.
+def rich(text: str) -> str:
+    """Text from the content file that may already carry <ruby> furigana.
 
-"""
+    The word tables were plain text before the ふりがな toggle reached them, so
+    anything without ruby markup is still escaped as ordinary text; a cell the
+    model wrote with furigana is passed through as markup instead.
+    """
+    text = str(text)
+    return text if "<ruby>" in text else esc(text)
+
+
+def _is_kana(ch: str) -> bool:
+    """True for hiragana, katakana and the long vowel mark — anything that
+    already reads itself and so needs no furigana above it."""
+    return "぀" <= ch <= "ヿ" or ch == "ー"
+
+
+def _to_hira(text: str) -> str:
+    """Katakana → hiragana, character for character, so a word written in
+    katakana can be lined up against a reading written in hiragana."""
+    return "".join(
+        chr(ord(ch) - 0x60) if "ァ" <= ch <= "ヶ" else ch for ch in text
+    )
+
+
+def word_ruby(word: str, reading: str) -> str:
+    """<ruby> markup for a word in the vocabulary table, built from its 読み.
+
+    The reading covers the whole word, so the furigana has to be split back
+    over the kanji runs only: 泊まる + 「と(まる)」 gives ruby(泊 → と) followed
+    by a bare まる, not とまる floating over the whole word. The kana already in
+    the word are what anchors the split — each kana run is located in the
+    reading, and whatever sits between two anchors belongs to the kanji run
+    between them.
+
+    Anything that doesn't line up (an irregular reading, a 「・」 listing two of
+    them) falls back to one ruby over the whole word, which is still correct,
+    just less pretty. Words with no kanji at all get no ruby.
+    """
+    full = re.sub(r"[()（）]", "", str(reading)).strip()
+    word = str(word)
+    if not full or all(_is_kana(ch) for ch in word):
+        return esc(word)
+
+    # Split the word into alternating kana / non-kana runs.
+    runs: list[tuple[bool, str]] = []
+    for ch in word:
+        kana = _is_kana(ch)
+        if runs and runs[-1][0] == kana:
+            runs[-1] = (kana, runs[-1][1] + ch)
+        else:
+            runs.append((kana, ch))
+
+    fallback = f"<ruby>{esc(word)}<rt>{esc(full)}</rt></ruby>"
+    hira = _to_hira(full)                      # index-for-index with `full`
+    out, pos, pending = [], 0, ""
+    for kana, text in runs:
+        if not kana:
+            pending = text
+            continue
+        # A kanji run must take at least one character of the reading.
+        found = hira.find(_to_hira(text), pos + 1 if pending else pos)
+        if found < 0 or (not pending and found != pos):
+            return fallback
+        if pending:
+            out.append(f'<ruby>{esc(pending)}<rt>{esc(full[pos:found])}</rt></ruby>')
+            pending = ""
+        out.append(esc(text))
+        pos = found + len(text)
+    if pending:
+        if pos >= len(full):
+            return fallback
+        out.append(f'<ruby>{esc(pending)}<rt>{esc(full[pos:])}</rt></ruby>')
+    elif pos != len(full):
+        return fallback                        # reading left over past the word
+    return "".join(out)
+
+
+def word_table_html(words: list[dict]) -> str:
+    """The 単語/読み/意味/English table.
+
+    Entries are {"w": word, "r": reading, "m": Japanese meaning, "e": English}.
+    `e` is optional: content files written before the column existed simply get
+    an empty last cell rather than failing to build.
+
+    The 単語 column carries furigana of its own (word_ruby), so the ふりがな
+    toggle works on the table too and not only on the sentences; the 意味
+    column shows whatever furigana the content file wrote into it.
+    """
     rows = [
-        f'    <tr><td class="word">{esc(word["w"])}</td>'
+        f'    <tr><td class="word">{word_ruby(word["w"], word.get("r", ""))}</td>'
         f'<td>{esc(word["r"])}</td>'
-        f'<td>{esc(word.get("m", ""))}</td></tr>'
+        f'<td>{rich(word.get("m", ""))}</td>'
+        f'<td class="en">{esc(word.get("e", ""))}</td></tr>'
         for word in words
     ]
     return "\n".join([
         "<table>",
         "  <thead>",
-        "    <tr><th>単語</th><th>読み</th><th>意味</th></tr>",
+        "    <tr><th>単語</th><th>読み</th><th>意味</th><th>English</th></tr>",
         "  </thead>",
         "  <tbody>",
         *rows,

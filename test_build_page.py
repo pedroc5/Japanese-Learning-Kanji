@@ -35,7 +35,9 @@ def sample_content() -> dict:
         "kanji": [
             {"char": "雷", "level": "N1", "on": "ライ", "kun": "かみなり",
              "meaning": "thunder", "strokes": "13", "radical": "雨",
-             "words": [{"w": "雷雨", "r": "らいう", "m": "雷をともなう雨"}],
+             "words": [{"w": "雷雨", "r": "らいう", "e": "thunderstorm",
+                        "m": "<ruby>雷<rt>かみなり</rt></ruby>をともなう<ruby>雨<rt>あめ</rt></ruby>"},
+                       {"w": "雷が鳴る", "r": "かみなりがなる", "m": "音がする", "e": "to thunder"}],
              "examples": ["<ruby>雷<rt>かみなり</rt></ruby>が<b>鳴</b>る。"]},
             {"char": "虹", "level": "N1", "on": "コウ", "kun": "にじ",
              "meaning": "rainbow", "strokes": "9", "radical": "虫",
@@ -226,6 +228,43 @@ class BuildPageTest(unittest.TestCase):
     def test_store_is_defined_before_the_quiz_script_uses_it(self):
         self.assertLess(self.page.index("window.__kanjiStore ="),
                         self.page.index("var store = window.__kanjiStore;"))
+
+
+class WordFuriganaTest(unittest.TestCase):
+    """The ふりがな toggle only reaches what carries <ruby>, so the vocabulary
+    table has to build its own from the 読み column."""
+
+    def test_okurigana_stays_out_of_the_furigana(self):
+        self.assertEqual(build_page.word_ruby("泊まる", "と(まる)"),
+                         "<ruby>泊<rt>と</rt></ruby>まる")
+        self.assertEqual(build_page.word_ruby("素泊まり", "すどまり"),
+                         "<ruby>素泊<rt>すど</rt></ruby>まり")
+        self.assertEqual(build_page.word_ruby("話し合う", "はな(し)あ(う)"),
+                         "<ruby>話<rt>はな</rt></ruby>し<ruby>合<rt>あ</rt></ruby>う")
+
+    def test_leading_kana_and_katakana_anchor_the_split(self):
+        self.assertEqual(build_page.word_ruby("お花見", "おはなみ"),
+                         "お<ruby>花見<rt>はなみ</rt></ruby>")
+        self.assertEqual(build_page.word_ruby("生ビール", "なまびーる"),
+                         "<ruby>生<rt>なま</rt></ruby>ビール")
+
+    def test_a_word_with_no_kanji_gets_no_ruby(self):
+        self.assertEqual(build_page.word_ruby("コーヒー", "こーひー"), "コーヒー")
+
+    def test_a_reading_that_does_not_line_up_falls_back_to_one_ruby(self):
+        # ふたつの読みを併記した欄。分割はあきらめて語全体に振る。
+        self.assertEqual(build_page.word_ruby("泊まる", "と(まる)・は(く)"),
+                         "<ruby>泊まる<rt>とまる・はく</rt></ruby>")
+
+    def test_the_table_carries_furigana_in_both_japanese_columns(self):
+        table = build_page.word_table_html(sample_content()["kanji"][0]["words"])
+        self.assertIn('<td class="word"><ruby>雷雨<rt>らいう</rt></ruby></td>', table)
+        self.assertIn("<ruby>雷<rt>かみなり</rt></ruby>をともなう", table)   # 意味の欄
+        self.assertIn("<td>らいう</td>", table)                            # 読みの欄はそのまま
+
+    def test_plain_meanings_are_still_escaped(self):
+        table = build_page.word_table_html([{"w": "雷", "r": "かみなり", "m": "a < b"}])
+        self.assertIn("a &lt; b", table)
 
 
 class QuizHistoryTest(unittest.TestCase):
