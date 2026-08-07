@@ -17,10 +17,16 @@ mkdir -p "$(dirname "$LOG")"
 {
   echo "===== $(date '+%Y-%m-%d %H:%M:%S') ====="
   # スキルフォルダ自体をカレントディレクトリにする。ここに .claude/settings.json があるので
-  # 自動実行に必要な権限（WebFetch/Bash/Edit）がこのディレクトリ基準で読み込まれる。
-  # 出力先(~/Documents/Claude-JP/漢字/)は変わらず絶対パスのまま。
+  # 自動実行に必要な権限（WebFetch/Bash/Edit）がこのディレクトリ基準で読み込まれる…はずだったが、
+  # headless の `-p` ではパス限定の許可ルール（Read(path/**) など）は、settings.json /
+  # settings.local.json のどちらに書いてあっても一切評価されない（trust dialogを出せないため
+  # 黙って無視される。ask_server.py の run_claude() で実証済み）。そのせいで
+  # kanji_history.json（スキルフォルダの外）を読めず、権限を尋ねる文章だけ出して exit 0 で
+  # 終わり、ページが1本も生成されない日が続いていた。ask_server.py と同じく、ベア名の
+  # --allowedTools で明示的に許可する（パス限定ではなくツール単位の許可なので headless でも効く）。
   cd "$HOME/.claude/skills/kanji-practice" || exit 1
-  claude -p "/kanji-practice" --permission-mode acceptEdits
+  claude -p "/kanji-practice" --permission-mode acceptEdits \
+    --allowedTools "Read Write Edit Bash WebFetch"
   echo "exit: $?"
 
   # 金曜日は、その週の全クラスをまとめた復習ページも作る（機械的な集計なのでclaudeは呼ばない）
