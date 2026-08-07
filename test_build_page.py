@@ -24,6 +24,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import build_page  # noqa: E402
+import build_review  # noqa: E402
 
 
 def sample_content() -> dict:
@@ -37,7 +38,10 @@ def sample_content() -> dict:
              "meaning": "thunder", "strokes": "13", "radical": "雨",
              "words": [{"w": "雷雨", "r": "らいう", "e": "thunderstorm",
                         "m": "<ruby>雷<rt>かみなり</rt></ruby>をともなう<ruby>雨<rt>あめ</rt></ruby>"},
-                       {"w": "雷が鳴る", "r": "かみなりがなる", "m": "音がする", "e": "to thunder"}],
+                       {"w": "雷が鳴る", "r": "かみなりがなる", "m": "音がする", "e": "to thunder"},
+                       {"w": "落雷", "r": "らくらい", "m": "かみなりが落ちること",
+                        "e": "lightning strike"},
+                       {"w": "雷鳴", "r": "らいめい", "m": "かみなりの音", "e": "thunderclap"}],
              "examples": ["<ruby>雷<rt>かみなり</rt></ruby>が<b>鳴</b>る。"]},
             {"char": "虹", "level": "N1", "on": "コウ", "kun": "にじ",
              "meaning": "rainbow", "strokes": "9", "radical": "虫",
@@ -290,6 +294,134 @@ class ExampleReuseTest(unittest.TestCase):
     def test_a_new_sentence_with_the_same_word_is_fine(self):
         self.assertEqual(
             build_page.reused_examples(self.content("<b>二泊三日</b>の出張から帰ってきた。")), [])
+
+
+class WeeklyReviewTest(unittest.TestCase):
+    """The Friday page is a summary table plus exercises — not a second copy of
+    the week's daily pages."""
+
+    def setUp(self) -> None:
+        self.content = sample_content()
+        self.kanji = self.content["kanji"]
+        self.history = {"kanji": {"雷": {"quiz": {"asked": 6, "wrong": 2, "last": "x"}}},
+                        "days": []}
+
+    def review_page(self) -> str:
+        quiz = build_review.exercises(self.kanji, shown=1)
+        sections = [build_page.collapsible("<h2>今週習った漢字</h2>",
+                                           build_review.summary_table(self.kanji, self.history)),
+                    build_page.quiz_section(quiz, [q["char"] for q in quiz],
+                                            heading="今週の練習問題")]
+        return build_page.build(self.content, {}, sections=sections,
+                                heading="漢字の復習", period="今週")
+
+    def test_the_table_has_one_row_per_kanji(self):
+        table = build_review.summary_table(self.kanji, self.history)
+        self.assertEqual(table.count("<tr>"), len(self.kanji) + 1)      # +見出し
+        self.assertIn('<td class="ch"><b>雷</b><span class="lvl n1">N1</span>', table)
+        self.assertIn("音 ライ<br>訓 かみなり", table)
+        self.assertIn("<ruby>雷雨<rt>らいう</rt></ruby>", table)          # よく使う語
+
+    def test_a_missed_kanji_is_flagged_in_the_table(self):
+        table = build_review.summary_table(self.kanji, self.history)
+        self.assertIn('<span class="miss">✕2／6問</span>', table)
+        self.assertEqual(table.count('class="miss"'), 1)                # 虹は無記録
+
+    # --- 出題する語の選び方 ------------------------------------------------ #
+
+    def test_the_table_words_are_not_the_ones_asked_about(self):
+        """表に読み付きで出ている語を問題にすると、答えを写すだけになる。"""
+        entry = {"char": "笑", "meaning": "わらう", "words": [
+            {"w": "笑顔", "r": "えがお"}, {"w": "微笑", "r": "びしょう"},
+            {"w": "苦笑", "r": "くしょう"}, {"w": "爆笑", "r": "ばくしょう"},
+            {"w": "談笑", "r": "だんしょう"}, {"w": "笑う", "r": "わら(う)"},
+            {"w": "笑い声", "r": "わら(いごえ)"}]}
+        shown = build_review.shown_words([entry])                # 先頭4語
+        reading, writing = build_review.pick_words(entry, shown)
+        for word in reading + [writing]:
+            self.assertNotIn(word["w"], shown)
+
+    def test_a_kanji_asked_in_both_reading_styles(self):
+        entry = {"char": "泊", "words": [
+            {"w": "宿泊", "r": "しゅくはく"}, {"w": "一泊", "r": "いっぱく"},
+            {"w": "泊まる", "r": "と(まる)"}, {"w": "泊める", "r": "と(める)"}]}
+        reading, _ = build_review.pick_words(entry, set())
+        self.assertEqual([word["w"] for word in reading], ["宿泊", "泊まる"])
+
+    def test_a_word_with_two_readings_is_never_asked_on_its_own(self):
+        """「怒る」だけ見せられても、おこる か いかる か決められない。"""
+        entry = {"char": "怒", "words": [
+            {"w": "怒る", "r": "おこ(る)"}, {"w": "怒る", "r": "いか(る)"},
+            {"w": "怒号", "r": "どごう"}, {"w": "怒り出す", "r": "おこ(りだす)"}]}
+        reading, writing = build_review.pick_words(entry, set())
+        self.assertEqual([word["w"] for word in reading], ["怒号", "怒り出す"])
+        self.assertIsNone(writing)          # 残りは「怒る」だけなので出題しない
+
+    def test_a_short_word_list_falls_back_to_the_table_words(self):
+        """語が少ない字は、問題が消えるより表と重なるほうがまし。"""
+        entry = {"char": "虹", "words": [{"w": "虹", "r": "にじ"}]}
+        reading, writing = build_review.pick_words(entry, {"虹"})
+        self.assertEqual([word["w"] for word in reading], ["虹"])
+        self.assertIsNone(writing)
+
+    # --- 問題そのもの ------------------------------------------------------ #
+
+    def test_the_questions_are_new_ones_not_the_daily_quiz(self):
+        """日々のページのクイズ文は使わない（もう一度答えても記憶を試すだけ）。"""
+        quiz = build_review.exercises(self.kanji, shown=1)
+        daily = [build_page.plain_sentence(q["q"]) for q in self.content["quiz"]]
+        for question in quiz:
+            self.assertNotIn(build_page.plain_sentence(question["q"]), daily)
+
+    def test_the_hint_naming_the_kanji_starts_folded(self):
+        entry = {"char": "泊", "meaning": "とまる",
+                 "words": [{"w": "宿泊", "r": "しゅくはく", "m": "とまること"}]}
+        question = build_review.writing_question(entry, entry["words"][0])
+        self.assertIn('<details class="hint"><summary>ヒント</summary>'
+                      "「泊」を使います。</details>", question["q"])
+        self.assertNotIn("open", question["q"])
+        # ヒントを開くまで、どの字かは問題文に出ていない
+        self.assertNotIn("泊", question["q"].split("<details", 1)[0])
+        self.assertEqual(question["ph"], "漢字で入力")
+
+    def test_a_meaning_that_gives_the_answer_away_is_replaced_by_the_english(self):
+        word = {"w": "宿泊", "r": "しゅくはく", "m": "宿泊すること", "e": "lodging"}
+        question = build_review.writing_question({"char": "泊"}, word)
+        self.assertIn("lodging", question["q"])
+        self.assertNotIn("宿泊", question["q"])
+
+    def test_each_kanji_is_read_before_it_is_written(self):
+        quiz = build_review.exercises(self.kanji, shown=1)
+        self.assertEqual([q["char"] for q in quiz], ["雷", "雷", "雷", "虹"])
+        self.assertEqual([("ph" in q) for q in quiz], [False, False, True, False])
+        self.assertEqual([q["a"] for q in quiz], ["らくらい", "かみなりがなる", "雷鳴", "にじ"])
+        self.assertTrue(quiz[0]["q"].startswith('<span class="qtag">読み</span>'))
+
+    # --- ページ全体 -------------------------------------------------------- #
+
+    def test_the_page_drops_the_strokes_and_the_tracing_boxes(self):
+        page = self.review_page()
+        body = markup(page)
+        self.assertNotIn('<svg class="strokes"', body)
+        self.assertNotIn("practice-block", body)
+        self.assertNotIn("KanjiVG", body.split('<p class="foot">')[1])   # 使っていない
+        self.assertEqual(re.findall(r"<h2>.*?</h2>", body),
+                         ["<h2>今週習った漢字</h2>", "<h2>今週の練習問題</h2>"])
+
+    def test_the_page_keeps_the_shared_furniture(self):
+        page = self.review_page()
+        for piece in ["furiganaToggle", "window.__kanjiStore", "window.__quizKey",
+                      'id="check"', "chatbox", "まとめて"]:
+            self.assertIn(piece, page)
+        parser = TagBalance()
+        parser.feed(page)
+        self.assertEqual((parser.errors, parser.stack), ([], []))
+
+    def test_the_exercises_are_gradable(self):
+        key = quiz_key(self.review_page())
+        self.assertEqual([entry["ok"][0] for entry in key],
+                         ["らくらい", "かみなりがなる", "雷鳴", "にじ"])
+        self.assertEqual([entry["char"] for entry in key], ["雷", "雷", "雷", "虹"])
 
 
 class QuizHistoryTest(unittest.TestCase):
