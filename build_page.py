@@ -2,10 +2,15 @@
 """Build the daily kanji practice HTML page from a content JSON file.
 
 The model writes the content (kanji, readings, words, examples, quiz) as JSON;
-this script does the mechanical part: generating the stroke-order GIFs with
-kanji_gif.py, embedding them as base64, and assembling the page.
+this script does the mechanical part: fetching the KanjiVG stroke data, drawing
+it as inline SVG, and assembling the page.
 
-    python build_page.py content.json --out ~/Documents/Claude-JP/漢字/漢字練習_2026-08-02.html
+    python build_page.py content.json
+    python build_page.py content.json --out ~/somewhere/漢字練習_2026-08-02.html
+
+Output goes to a folder per week — ~/Documents/Claude-JP/漢字/2026-07-27〜08-02/ —
+so a day's page, its content JSON and its まとめ sit together with that week's
+復習 page (see week_folder()).
 
 See SKILL.md for the JSON schema.
 """
@@ -19,13 +24,14 @@ import re
 import sys
 import urllib.request
 import xml.etree.ElementTree as ET
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_SVG_CACHE = HERE / ".kanjivg_cache"
 KVG_RAW = "https://raw.githubusercontent.com/KanjiVG/kanjivg/master/kanji/{cp}.svg"
-DEFAULT_HISTORY = Path.home() / "Documents" / "Claude-JP" / "漢字" / "kanji_history.json"
+DEFAULT_ROOT = Path.home() / "Documents" / "Claude-JP" / "漢字"
+DEFAULT_HISTORY = DEFAULT_ROOT / "kanji_history.json"
 
 # Quiz results dropped here by ask_server.py when まとめて is pressed, and folded
 # into kanji_history.json by the next daily build. They take this detour because
@@ -1737,6 +1743,23 @@ def build(content: dict, strokes: dict[str, dict | None], content_file: str = ""
     ])
 
 
+def week_folder(day: str) -> str:
+    """「2026-08-03〜08-09」 — the Monday-to-Sunday week a date belongs to.
+
+    One folder per week keeps ~/Documents/Claude-JP/漢字 navigable: a day's
+    page, its content JSON and its まとめ live together with the week's 復習
+    page instead of piling up as a flat list of dated files. The folder starts
+    with the Monday's full date so the folders sort chronologically by name.
+    """
+    monday = date.fromisoformat(day) - timedelta(days=date.fromisoformat(day).weekday())
+    return f"{monday.isoformat()}〜{monday + timedelta(days=6):%m-%d}"
+
+
+def day_page_path(day: str, root: Path = DEFAULT_ROOT) -> Path:
+    """Where a day's practice page goes: <root>/<週>/漢字練習_<date>.html."""
+    return root / week_folder(day) / f"漢字練習_{day}.html"
+
+
 def content_json_path(out: Path) -> Path:
     """Where to save the content JSON beside a given output page.
 
@@ -1772,7 +1795,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="漢字練習HTMLを組み立てる")
     parser.add_argument("content", type=Path, help="内容を書いたJSONファイル")
     parser.add_argument("--out", type=Path,
-                        help="出力HTML（既定：~/Documents/Claude-JP/漢字/漢字練習_<date>.html）")
+                        help="出力HTML（既定：~/Documents/Claude-JP/漢字/<その週>/漢字練習_<date>.html）")
     parser.add_argument("--svg-cache", type=Path, default=DEFAULT_SVG_CACHE,
                         help="KanjiVGのSVGを置くキャッシュ（既定：スキルフォルダの.kanjivg_cache）")
     parser.add_argument("--skip-strokes", action="store_true",
@@ -1790,7 +1813,8 @@ def main() -> int:
 
     content = json.loads(args.content.read_text(encoding="utf-8"))
     day = content.get("date") or date.today().isoformat()
-    out = args.out or (Path.home() / "Documents" / "Claude-JP" / "漢字" / f"漢字練習_{day}.html")
+    # 既定の置き場は週ごとのフォルダ（--history を別の場所に向けたときはその隣）。
+    out = args.out or day_page_path(day, args.history.parent)
     content_out = args.content_out or content_json_path(out)
 
     # An extra class on a day that already has a page merges into it rather

@@ -284,7 +284,8 @@ def main() -> int:
     parser.add_argument("--date", default=date.today().isoformat(),
                         help="この日を含む週を復習する（既定：今日）")
     parser.add_argument("--history", type=Path, default=build_page.DEFAULT_HISTORY)
-    parser.add_argument("--out", type=Path, help="出力HTML（既定：<historyの親>/復習_<date>.html）")
+    parser.add_argument("--out", type=Path,
+                        help="出力HTML（既定：<historyの親>/<その週>/復習_<date>.html）")
     parser.add_argument("--no-writing", action="store_true",
                         help="書き取り問題を作らない（読みの問題だけにする）")
     args = parser.parse_args()
@@ -342,7 +343,9 @@ def main() -> int:
         "",
     ]
 
-    out = args.out or (args.history.parent / f"復習_{args.date}.html")
+    # 日々のページと同じ、その週のフォルダに置く。
+    out = args.out or (args.history.parent / build_page.week_folder(args.date)
+                       / f"復習_{args.date}.html")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(build_page.build(merged_content, {}, page_id=f"review:{args.date}",
                                     sections=sections, heading="漢字の復習", period="今週"),

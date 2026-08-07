@@ -195,9 +195,9 @@ python3 ~/.claude/skills/kanji-practice/build_page.py /tmp/kanji_content.json
   保存先はページごと（`data-page-id` = `<kind>:<date>`）に分ける。
 - 右下に「まとめて」ボタンを組み込む（`summarize_button_html()`）。押すと、今日のcontent JSON・
   クイズの入力欄の解答・チャットの会話をローカルサーバー（`/summarize`）に送り、Claudeが
-  `~/Documents/Claude-JP/漢字/まとめ_<date>.html` を**別ファイルとして**書く
+  その週のフォルダに `まとめ_<date>.html` を**別ファイルとして**書く
   （クイズの採点、チャットで聞いた語彙などの質問の振り返りも含める）。
-- 内容JSONのコピーを `~/Documents/Claude-JP/漢字/content_<date>.json` に自動保存し、
+- 内容JSONのコピーをページと同じフォルダの `content_<date>.json` に自動保存し、
   `kanji_history.json` に今日の字・テーマを自動追記する（履歴の更新はスクリプトが自動でやるので、
   手作業でこのファイルを編集する必要はない）
 - 溜まっているクイズの成績を `kanji_history.json` に取り込む（`ingest_quiz_results()`）。
@@ -206,11 +206,15 @@ python3 ~/.claude/skills/kanji-practice/build_page.py /tmp/kanji_content.json
   履歴へ書くのは毎朝のこのビルドの役目。取り込んだファイルは二重計上を防ぐため消す。
   記録は字ごとの `{"asked": n, "wrong": n, "last": "<date>"}`。
 
-出力先は `~/Documents/Claude-JP/漢字/漢字練習_<date>.html`。
+出力先は **その週のフォルダ**：`~/Documents/Claude-JP/漢字/<月曜〜日曜>/漢字練習_<date>.html`
+（例：`~/Documents/Claude-JP/漢字/2026-08-03〜08-09/漢字練習_2026-08-05.html`）。
+フォルダ名は `build_page.week_folder()` が日付から決める（月曜始まり・日曜終わり、名前順＝時系列）。
+無ければ自動で作られるので、事前に用意しなくてよい。その週のページ・内容JSON・まとめ・復習が
+1つのフォルダにまとまる。`kanji_history.json` とログだけは今までどおり `漢字/` 直下に置く。
 
 オプション:
 - `--skip-strokes`（筆順を読み込まない・テスト用）、`--svg-cache <dir>`、`--out <path>`
-- **同じ日にもう1クラス追加で頼まれたとき** … その日の `漢字練習_<date>.html` が既にあるかを確認し、
+- **同じ日にもう1クラス追加で頼まれたとき** … その週のフォルダに `漢字練習_<date>.html` が既にあるかを確認し、
   あれば新しいファイルを作るのではなく、その日のページに**合流**させる：
   1. 新しいクラスの分だけ（テーマ・字10個・単語・クイズ）を通常通りJSONに書く（`date` は同じ日付のまま）。
   2. `--kind extra --append` を付けて実行する：

@@ -296,6 +296,28 @@ class ExampleReuseTest(unittest.TestCase):
             build_page.reused_examples(self.content("<b>二泊三日</b>の出張から帰ってきた。")), [])
 
 
+class WeekFolderTest(unittest.TestCase):
+    """Everything a week produces lands in one folder named after that week."""
+
+    def test_a_week_runs_monday_to_sunday(self):
+        for day in ["2026-08-03", "2026-08-05", "2026-08-09"]:      # 月・水・日
+            self.assertEqual(build_page.week_folder(day), "2026-08-03〜08-09")
+        self.assertEqual(build_page.week_folder("2026-08-02"), "2026-07-27〜08-02")
+        self.assertEqual(build_page.week_folder("2026-08-10"), "2026-08-10〜08-16")
+
+    def test_folder_names_sort_chronologically(self):
+        names = [build_page.week_folder(d) for d in
+                 ["2026-12-28", "2027-01-04", "2026-08-31"]]
+        self.assertEqual(sorted(names), ["2026-08-31〜09-06", "2026-12-28〜01-03",
+                                         "2027-01-04〜01-10"])
+
+    def test_the_day_page_and_its_content_json_share_the_folder(self):
+        page = build_page.day_page_path("2026-08-05", Path("/tmp/漢字"))
+        self.assertEqual(page, Path("/tmp/漢字/2026-08-03〜08-09/漢字練習_2026-08-05.html"))
+        self.assertEqual(build_page.content_json_path(page).parent, page.parent)
+        self.assertEqual(build_page.content_json_path(page).name, "content_2026-08-05.json")
+
+
 class WeeklyReviewTest(unittest.TestCase):
     """The Friday page is a summary table plus exercises — not a second copy of
     the week's daily pages."""
