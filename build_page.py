@@ -187,6 +187,29 @@ CSS = """
   td{border:1px solid var(--border); padding:10px 12px; vertical-align:top}
   tbody tr:nth-child(even){background:var(--light)}
   .word{white-space:nowrap; color:var(--navy)}
+  /* 復習ページの一覧表（1字1行）。字の欄だけ大きく、その下にレベルと取りこぼしを出す。 */
+  .sum{font-size:14px}
+  .sum td{padding:8px 10px}
+  .sum{table-layout:fixed}
+  .sum .ch{text-align:center; white-space:nowrap; width:66px}
+  .sum .ch b{font-size:26px; color:var(--navy); line-height:1.2}
+  .sum .ch .lvl{display:block; width:fit-content; margin:3px auto 0}
+  .sum .miss{display:block; font-size:11px; font-weight:700; color:var(--accent); margin-top:3px}
+  .sum td:nth-child(2){width:24%}
+  .sum td:nth-child(3){width:30%}
+  .sum .yomi{color:var(--navy)}
+  .sum .yomi, .sum td:nth-child(4){word-break:break-word}
+  /* 練習問題の「読み」「書き」ラベル */
+  .qtag{display:inline-block; min-width:2.4em; text-align:center; font-size:11px;
+        font-weight:700; color:#fff; background:var(--grey); border-radius:3px;
+        padding:1px 6px; margin-right:8px; vertical-align:2px; user-select:none}
+  .qtag.write{background:var(--accent)}
+  /* 書き取り問題の「ヒント」。問題文の中に置くので、節の <details> とは別の見た目にする。 */
+  .hint{display:inline-block; margin:0 0 0 8px; padding:0 10px; font-size:13px;
+        background:#fff; border:1px solid var(--border); border-radius:4px}
+  .hint summary{padding:4px 0; font-size:12px; color:var(--grey)}
+  .hint[open]{background:var(--light); border-color:var(--navy)}
+  .hint[open] summary{color:var(--navy)}
   details{margin-top:10px; background:var(--light); border-radius:6px; padding:4px 16px}
   summary{cursor:pointer; color:var(--navy); font-weight:700; padding:10px 0;
           list-style:none; user-select:none}
@@ -1145,23 +1168,38 @@ def furigana_toggle_html() -> str:
     ])
 
 
-def intro_box_html(theme: str, count: int, chars: str, note: str = "") -> str:
+def intro_box_html(theme: str, count: int, chars: str, note: str = "",
+                   strokes: bool = True, period: str = "今日") -> str:
     """The orange "how to use this page" box under the title.
 
     `note` is an optional page-specific line — the weekly review uses it to say
     that the kanji are ordered by what was missed.
+    `strokes` says whether this page actually draws stroke order and tracing
+    boxes. The weekly review doesn't, and a box explaining buttons that aren't
+    on the page is worse than no box.
+    `period` is what this page covers — 今日 for a daily page, 今週 for the
+    weekly review.
     """
-    return "\n".join([
-        '<div class="box warm">',
-        f"  <p>今日のテーマ：{esc(theme)}　／　今日の{count}字：{chars}</p>",
-        *([f'  <p class="en"><b>{esc(note)}</b></p>'] if note else []),
-        '  <p class="en">まず読み方と単語を確認してから、最後の復習クイズに挑戦してください。</p>',
+    stroke_help = [
         '  <p class="en">※筆順アニメーションは KanjiVG（CC BY-SA 3.0）のデータから作成しています。'
         "赤ではなく画ごとに色が変わり、数字が何画目かを示します。</p>",
-        '  <p class="en">※左上の「ふりがな」ボタンで、例文とクイズの読みを表示/非表示にできます。</p>',
-        '  <p class="en">※青い見出しをクリックすると、その節をたたんだり開いたりできます。</p>',
         '  <p class="en">※各字の書き取り練習では「書き順を確認する」で、画数と各画の向きを見てもらえます。'
         "書き順の基本：①上から下へ　②左から右へ　③横画→縦画　④外側の囲み→中身→ふたは最後。</p>",
+    ]
+    # 何を読む順に案内するかはページの種類（今日／今週）で決まる。筆順の有無で
+    # 決めると、通信に失敗して筆順が読めなかった日々のページが週次ページの案内文に
+    # なってしまう。
+    lead = ("上の一覧で読み方と意味を思い出してから、下の練習問題を解いてください。"
+            "字ごとの筆順・書き取り・例文は、その日の練習ページにあります。" if period == "今週" else
+            "まず読み方と単語を確認してから、最後の復習クイズに挑戦してください。")
+    return "\n".join([
+        '<div class="box warm">',
+        f"  <p>{period}のテーマ：{esc(theme)}　／　{period}の{count}字：{chars}</p>",
+        *([f'  <p class="en"><b>{esc(note)}</b></p>'] if note else []),
+        f'  <p class="en">{lead}</p>',
+        *(stroke_help if strokes else []),
+        '  <p class="en">※左上の「ふりがな」ボタンで、例文とクイズの読みを表示/非表示にできます。</p>',
+        '  <p class="en">※青い見出しをクリックすると、その節をたたんだり開いたりできます。</p>',
         '  <p class="en">※チャット欄は左端をドラッグするか「⤢」を押すと広げられます。</p>',
         "</div>",
     ])
@@ -1468,13 +1506,22 @@ def reused_examples(content: dict) -> list[str]:
     return hits
 
 
-def quiz_section(quiz: list[dict], chars: list[str]) -> str:
+def quiz_section(quiz: list[dict], chars: list[str],
+                 heading: str = "復習クイズ(読み方をひらがなで書いてください)") -> str:
     """The review quiz: input per question, a collapsible answer list, and the
     answer key as JS data for the in-page "answer check" button.
 
     Each quiz entry is {"q": question HTML, "a": answer, "alt": [near misses],
     "note": explanation, "char": the kanji it tests}. Question text is left
     unescaped because it carries <ruby> markup for the furigana toggle.
+
+    An entry may also carry "ph", the input's placeholder. It defaults to
+    ひらがなで入力 because nearly every question asks for a reading; the weekly
+    page's 書き取り questions want 漢字で入力 instead.
+
+    `heading` names the section — the weekly page's list is not only readings,
+    so it says so. The section is returned already wrapped in its foldable
+    heading; callers place it in the page, they don't wrap it again.
 
     `chars` is the per-question kanji from quiz_chars(); it rides along in the
     answer key so the browser can report which character each result belongs
@@ -1490,7 +1537,8 @@ def quiz_section(quiz: list[dict], chars: list[str]) -> str:
     for i, question in enumerate(quiz):
         question_items.append(
             f'  <li>{question["q"]}\n'
-            f'    <div class="qline"><input class="ans" data-q="{i}" placeholder="ひらがなで入力">'
+            f'    <div class="qline"><input class="ans" data-q="{i}"'
+            f' placeholder="{attr_esc(question.get("ph", "ひらがなで入力"))}">'
             f'<span class="res" data-r="{i}"></span></div></li>')
         note = question.get("note", "")
         answer_items.append(
@@ -1566,7 +1614,7 @@ def quiz_section(quiz: list[dict], chars: list[str]) -> str:
   });
 })();
 </script>""" % ("\n".join(question_items), "\n".join(answer_items), ",\n".join(answer_key))
-    return collapsible("<h2>復習クイズ(読み方をひらがなで書いてください)</h2>", body)
+    return collapsible(f"<h2>{esc(heading)}</h2>", body)
 
 
 def level_summary(kanji: list[dict]) -> str:
@@ -1586,7 +1634,8 @@ def level_summary(kanji: list[dict]) -> str:
 
 
 def build(content: dict, strokes: dict[str, dict | None], content_file: str = "",
-          page_id: str = "") -> str:
+          page_id: str = "", sections: list[str] | None = None,
+          heading: str = "漢字練習", period: str = "今日") -> str:
     """Assemble the whole self-contained practice page and return it as HTML.
 
     `strokes` maps character -> KanjiVG stroke data (or None when it couldn't
@@ -1596,6 +1645,13 @@ def build(content: dict, strokes: dict[str, dict | None], content_file: str = ""
     `page_id` namespaces the page's saved quiz answers and chat log; it has to
     separate a day's practice page from that day's review page, which would
     otherwise share a date and overwrite each other's drafts.
+    `sections` replaces the body — one block of HTML per section. The daily page
+    leaves it None and gets the standard "a section per kanji, then the quiz";
+    build_review.py passes its own (a summary table, then the exercises) so the
+    weekly page can be shaped differently while sharing this shell: same CSS,
+    same furigana toggle, same drafts, same chat and まとめ wiring.
+    `heading` is the <h1> and the browser title, `period` the word the intro
+    box uses for what the page covers (今日 / 今週).
 
     The page is emitted indented and commented, so it can be read (and diffed)
     as HTML rather than only viewed in a browser.
@@ -1604,25 +1660,30 @@ def build(content: dict, strokes: dict[str, dict | None], content_file: str = ""
     theme = content.get("theme", "")
     chars = "・".join(entry["char"] for entry in content["kanji"])
 
-    sections = []
-    for i, entry in enumerate(content["kanji"], 1):
-        level = entry.get("level", "N3").upper()
-        sections += [banner(f'{i}. {entry["char"]}（{level}）'),
-                     kanji_section(i, entry, strokes.get(entry["char"])), ""]
-    sections += [banner("復習クイズ"),
-                 quiz_section(content["quiz"],
-                              quiz_chars(content["quiz"], content["kanji"])), ""]
+    if sections is None:
+        sections = []
+        for i, entry in enumerate(content["kanji"], 1):
+            level = entry.get("level", "N3").upper()
+            sections += [banner(f'{i}. {entry["char"]}（{level}）'),
+                         kanji_section(i, entry, strokes.get(entry["char"])), ""]
+        sections += [banner("復習クイズ"),
+                     quiz_section(content["quiz"],
+                                  quiz_chars(content["quiz"], content["kanji"])), ""]
 
+    # KanjiVG is credited where its data is actually embedded, so the review
+    # page — which draws no strokes — doesn't claim to use it.
+    credit = " ／ 筆順データ：KanjiVG (CC BY-SA 3.0)" if any(strokes.values()) else ""
     wrap = "\n".join([
-        "<h1>漢字練習</h1>",
+        f"<h1>{esc(heading)}</h1>",
         f'<p class="sub">{day}　テーマ：<b>{esc(theme)}</b>　'
         f'({level_summary(content["kanji"])})</p>',
         "",
-        intro_box_html(theme, len(content["kanji"]), chars, content.get("note", "")),
+        intro_box_html(theme, len(content["kanji"]), chars, content.get("note", ""),
+                       strokes=bool(any(strokes.values())), period=period),
         "",
         "\n".join(sections).rstrip(),
         "",
-        f'<p class="foot">JLPT漢字練習 ／ {day} ／ 筆順データ：KanjiVG (CC BY-SA 3.0)</p>',
+        f'<p class="foot">JLPT漢字練習 ／ {day}{credit}</p>',
     ])
 
     page = "\n".join([
@@ -1641,7 +1702,7 @@ def build(content: dict, strokes: dict[str, dict | None], content_file: str = ""
         "<head>",
         '<meta charset="utf-8">',
         '<meta name="viewport" content="width=device-width, initial-scale=1">',
-        f"<title>漢字練習 {day}</title>",
+        f"<title>{esc(heading)} {day}</title>",
         "<style>",
         CSS.strip("\n"),
         "</style>",
