@@ -73,7 +73,15 @@ Pedro（JLPT学習者）向けの毎日の漢字練習HTMLを作る。文章は�
 
 ### 5. 内容をJSONに書く
 
-`/tmp/kanji_content.json` に次の形式で書く。**例文とクイズの問題文の中の漢字は、対象の熟語だけ`<b>`で囲み、
+内容JSONの置き場は、**環境変数 `KANJI_CONTENT_JSON` があればそのパス**、無ければ
+`/tmp/kanji_content.json`。予約実行（`run_daily.sh`）は実行ごとに別のパスを渡してくるので、
+対話セッションと同時に走っても内容を奪い合わない（以前は共有パスのせいで取り違えが起きた）。
+
+```bash
+CONTENT="${KANJI_CONTENT_JSON:-/tmp/kanji_content.json}"
+```
+
+次の形式で書く。**例文とクイズの問題文の中の漢字は、対象の熟語だけ`<b>`で囲み、
 文中の漢字は（対象語も含めて）すべて`<ruby>字<rt>よみ</rt></ruby>`でふりがなを付ける**
 （ページ右上「ふりがな」トグルで表示/非表示を切り替えるため。JSONの中でHTMLタグを使ってよいのは
 `examples`・`quiz.q`・単語の`m`（意味）だけ。単語そのもの（`w`）のふりがなは`r`から
@@ -159,7 +167,7 @@ Pedro（JLPT学習者）向けの毎日の漢字練習HTMLを作る。文章は�
 ### 6. ページを作る
 
 ```bash
-python3 ~/.claude/skills/kanji-practice/build_page.py /tmp/kanji_content.json
+python3 ~/.claude/skills/kanji-practice/build_page.py "${KANJI_CONTENT_JSON:-/tmp/kanji_content.json}"
 ```
 
 これが自動でやること:
@@ -224,7 +232,7 @@ python3 ~/.claude/skills/kanji-practice/build_page.py /tmp/kanji_content.json
   1. 新しいクラスの分だけ（テーマ・字10個・単語・クイズ）を通常通りJSONに書く（`date` は同じ日付のまま）。
   2. `--kind extra --append` を付けて実行する：
      ```bash
-     python3 ~/.claude/skills/kanji-practice/build_page.py /tmp/kanji_content.json --kind extra --append
+     python3 ~/.claude/skills/kanji-practice/build_page.py "${KANJI_CONTENT_JSON:-/tmp/kanji_content.json}" --kind extra --append
      ```
   3. 既存の `content_<date>.json` があれば自動でそこに合流し（字は重複除去、クイズは追加、テーマは
      「Aテーマ＋Bテーマ」のように連結）、同じ `漢字練習_<date>.html` を上書きする。既存ファイルが
@@ -297,9 +305,17 @@ Pedroにそのまま黙って進めず、次回から気をつける（同じ字
   場所が違うときは `--maker <path>`。SVGのダウンロードキャッシュも
   `~/.claude/skills/kanji-practice/.kanjivg_cache/` に置く（`--cache-dir`で変更可）。
 - `svgpathtools`, `Pillow`, `requests` が必要（conda環境 `kanji` に入っている）。
-- 平日（月〜金）10:00に launchd（`com.pedro.kanji-daily`）が自動実行する。Pedroが日中に追加のクラスを
+- 平日（月〜金）9:00に launchd（`com.pedro.kanji-daily`）が自動実行する（時刻の実体は
+  `com.pedro.kanji-daily.plist` の `StartCalendarInterval`）。Pedroが日中に追加のクラスを
   頼んできたときは、上記の `--kind extra --append` の手順でその日のページに合流させればよい
   （自動実行や翌日以降のスケジュールを妨げない）。
+- **予約実行と対話セッションのかち合いについて。** 内容JSONは実行ごとに別パスになったので
+  （上記 `KANJI_CONTENT_JSON`）、待ち合わせは基本的に要らない。それでも2つの実行が同じ日の
+  ページを同時に書きそうなときだけ、`--kind extra --append` で合流させる。
+  **`launchctl list | grep kanji-daily` が動いている実行を見つけても、それが自分自身かどうかを
+  必ず確かめること。** `KANJI_DAILY_RUN` が設定されていれば、それは自分＝予約実行なので、
+  絶対に待ってはいけない。2026-08-17に、この確認を怠った自動実行が自分自身の終了を待ち、
+  ページを1本も作らずに exit 0 で終わっている。
 - 自動実行は `claude -p "/kanji-practice" --permission-mode acceptEdits`（`run_daily.sh`）で行われる。
   カレントディレクトリはこのスキルフォルダ自身（`~/.claude/skills/kanji-practice/`）にしてあり、
   そこにある `.claude/settings.json` で、jlptsensei.comへのWebFetchや`build_page.py`/`build_review.py`
