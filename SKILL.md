@@ -11,8 +11,12 @@ Pedro（JLPT学習者）向けの毎日の漢字練習HTMLを作る。文章は�
 
 ### 1. 履歴を確認する
 
-`~/Documents/Claude-JP/漢字/kanji_history.json` を読む。これが**全期間の履歴**（`build_page.py`/`build_review.py`
+`~/.claude/skills/kanji-practice/kanji_history.json` を読む。これが**全期間の履歴**（`build_page.py`/`build_review.py`
 が毎回自動更新する）で、直近のファイルだけを見るのではなく、ここに載っている字は**一度でも出したら二度と出さない**。
+
+> 履歴と内容JSON（`.content/content_<date>.json`）は `~/Documents` ではなく**スキルフォルダ**に置く。
+> `~/Documents` はTCC保護下で、launchdから動くプロセスは新規ファイルを作れても既存ファイルを
+> 読み返せない（EPERM）。2026-08-07の金曜、`build_review.py` がこれで落ちて復習ページが作られなかった。
 
 - `history["kanji"]` … これまでに使った字とレベル・テーマ・使用日の辞書。候補の字はここと必ず突き合わせる。
 - `history["days"]` … 日ごとの記録（テーマ・その日の字・kind: daily/extra/review）。直近のテーマ傾向を見るのに使う。
@@ -202,15 +206,16 @@ python3 ~/.claude/skills/kanji-practice/build_page.py /tmp/kanji_content.json
   手作業でこのファイルを編集する必要はない）
 - 溜まっているクイズの成績を `kanji_history.json` に取り込む（`ingest_quiz_results()`）。
   「まとめて」を押したときの正誤は `ask_server.py` がスキルフォルダの `.quiz_results/<date>.json`
-  に置く。ask_serverはlaunchd常駐で `~/Documents/Claude-JP` に書き込めない（TCC）ため、
+  に置く。履歴ファイルは毎朝のビルドが丸ごと書き直すので、常駐サーバーが直接書くと競合する。
   履歴へ書くのは毎朝のこのビルドの役目。取り込んだファイルは二重計上を防ぐため消す。
   記録は字ごとの `{"asked": n, "wrong": n, "last": "<date>"}`。
 
 出力先は **その週のフォルダ**：`~/Documents/Claude-JP/漢字/<月曜〜日曜>/漢字練習_<date>.html`
 （例：`~/Documents/Claude-JP/漢字/2026-08-03〜08-09/漢字練習_2026-08-05.html`）。
 フォルダ名は `build_page.week_folder()` が日付から決める（月曜始まり・日曜終わり、名前順＝時系列）。
-無ければ自動で作られるので、事前に用意しなくてよい。その週のページ・内容JSON・まとめ・復習が
-1つのフォルダにまとまる。`kanji_history.json` とログだけは今までどおり `漢字/` 直下に置く。
+無ければ自動で作られるので、事前に用意しなくてよい。その週のページ・まとめ・復習が
+1つのフォルダにまとまる。ログは今までどおり `漢字/` 直下。
+`kanji_history.json` と内容JSON（`.content/`）だけはスキルフォルダ側（TCCのため・上記参照）。
 
 オプション:
 - `--skip-strokes`（筆順を読み込まない・テスト用）、`--svg-cache <dir>`、`--out <path>`

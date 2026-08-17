@@ -4,8 +4,14 @@ Everything runs locally: your `kanji` conda env, your network, your files.
 The skill folder is self-contained — the GIF-maker script, its SVG cache, and
 the permission settings for unattended runs all live inside
 `~/.claude/skills/kanji-practice/`. Only the generated pages themselves
-(`content_*.json`, `漢字練習_*.html`, `kanji_history.json`, the GIF cache) live
-under `~/Documents/Claude-JP/漢字/` — that output location never changes.
+(`漢字練習_*.html`, `復習_*.html`, `まとめ_*.html`) and the logs live under
+`~/Documents/Claude-JP/漢字/` — that output location never changes.
+
+The study record (`kanji_history.json`) and the per-day content JSON
+(`.content/content_*.json`) are deliberately kept in the skill folder instead.
+`~/Documents` is TCC-protected: a launchd-spawned process can create new files
+there but cannot list the folder or read back files another process wrote, so
+anything the scheduled run has to *re-read* has to live outside it.
 
 ## 1. Install Claude Code
 

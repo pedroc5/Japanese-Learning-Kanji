@@ -6,6 +6,13 @@ __pycache__/
 # まとめて を押したときのクイズの成績。次のビルドが履歴に取り込んで消す一時ファイル
 .quiz_results/
 
+# 全期間の学習履歴。~/Documents はTCC保護下でlaunchdから読めないためここに置いているが、
+# 個人の学習記録なので追跡はしない（build_page.DEFAULT_HISTORY のコメント参照）
+kanji_history.json
+
+# その日の内容JSON。同じくTCCのためスキルフォルダに置く（ページ本体はDocumentsのまま）
+.content/
+
 # graphify の生成物（知識グラフ・キャッシュ・コスト記録）は作り直せるので追跡しない
 graphify-out/
 

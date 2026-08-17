@@ -9,8 +9,10 @@ it as inline SVG, and assembling the page.
     python build_page.py content.json --out ~/somewhere/漢字練習_2026-08-02.html
 
 Output goes to a folder per week — ~/Documents/Claude-JP/漢字/2026-07-27〜08-02/ —
-so a day's page, its content JSON and its まとめ sit together with that week's
-復習 page (see week_folder()).
+so a day's page and its まとめ sit together with that week's 復習 page (see
+week_folder()). The content JSON behind each page is the one piece kept out of
+there, in the skill folder, because launchd has to read it back (see
+DEFAULT_CONTENT_DIR).
 
 See SKILL.md for the JSON schema.
 """
@@ -31,14 +33,29 @@ HERE = Path(__file__).resolve().parent
 DEFAULT_SVG_CACHE = HERE / ".kanjivg_cache"
 KVG_RAW = "https://raw.githubusercontent.com/KanjiVG/kanjivg/master/kanji/{cp}.svg"
 DEFAULT_ROOT = Path.home() / "Documents" / "Claude-JP" / "漢字"
-DEFAULT_HISTORY = DEFAULT_ROOT / "kanji_history.json"
+
+# 履歴だけは出力先（DEFAULT_ROOT）から切り離してスキルフォルダに置く。
+# ~/Documents はTCC保護下にあり、launchdから動くプロセス（毎朝の run_daily.sh と
+# ask_server.py）には Files-and-Folders の許可がない。その状態でも「新しいファイルを
+# 作る」ことはできるので毎日のHTML生成は通るが、フォルダの一覧と、他のプロセスが
+# 作った既存ファイルの読み込みは EPERM で弾かれる。履歴は読んで書き直すファイルなので
+# ~/Documents では成立しない（2026-08-07の金曜、build_review.py がまさにこれで落ちた）。
+# スキルフォルダは保護対象外で、launchd下でも読み書きできる。
+DEFAULT_HISTORY = HERE / "kanji_history.json"
 
 # Quiz results dropped here by ask_server.py when まとめて is pressed, and folded
-# into kanji_history.json by the next daily build. They take this detour because
-# ask_server.py runs under launchd without a Files-and-Folders grant for
-# ~/Documents/Claude-JP and cannot write the history file itself (see the long
-# note in ask_server._handle_summarize); the skill folder it can always write.
+# into kanji_history.json by the next daily build. The detour originally existed
+# because the history sat in ~/Documents where ask_server.py could not write it;
+# now that the history is here too, that reason is gone, but the staging stays:
+# the daily build rewrites the history file whole, so letting the always-on
+# server write it directly would race that rewrite and lose records.
 QUIZ_RESULTS_DIR = HERE / ".quiz_results"
+
+# その日の内容JSON。ページ本体（HTML）は今までどおり ~/Documents/Claude-JP/漢字 の
+# 週フォルダに置くが、このJSONだけはスキルフォルダに置く。金曜の build_review.py と
+# ask_server.py の「まとめて」は、どちらもlaunchd下からこれを *読む* 必要があり、
+# ~/Documents では EPERM で読めない（DEFAULT_HISTORY のコメント参照）。
+DEFAULT_CONTENT_DIR = HERE / ".content"
 
 
 # --------------------------------------------------------------------------- #
@@ -1747,9 +1764,9 @@ def week_folder(day: str) -> str:
     """「2026-08-03〜08-09」 — the Monday-to-Sunday week a date belongs to.
 
     One folder per week keeps ~/Documents/Claude-JP/漢字 navigable: a day's
-    page, its content JSON and its まとめ live together with the week's 復習
-    page instead of piling up as a flat list of dated files. The folder starts
-    with the Monday's full date so the folders sort chronologically by name.
+    page and its まとめ live together with the week's 復習 page instead of
+    piling up as a flat list of dated files. The folder starts with the
+    Monday's full date so the folders sort chronologically by name.
     """
     monday = date.fromisoformat(day) - timedelta(days=date.fromisoformat(day).weekday())
     return f"{monday.isoformat()}〜{monday + timedelta(days=6):%m-%d}"
@@ -1760,15 +1777,19 @@ def day_page_path(day: str, root: Path = DEFAULT_ROOT) -> Path:
     return root / week_folder(day) / f"漢字練習_{day}.html"
 
 
-def content_json_path(out: Path) -> Path:
-    """Where to save the content JSON beside a given output page.
+def content_json_path(out: Path, content_dir: Path = DEFAULT_CONTENT_DIR) -> Path:
+    """Where to save the content JSON for a given output page.
 
     漢字練習_2026-08-02.html -> content_2026-08-02.json. Any other name is
     just prefixed, so the pairing stays obvious whatever --out is given.
+
+    The name is derived from the page, but the file lands in `content_dir`
+    (the skill folder), not beside the page: build_review.py and ask_server.py
+    both read it from launchd, where ~/Documents is unreadable.
     """
     stem = (out.stem.replace("漢字練習", "content", 1) if "漢字練習" in out.stem
             else f"content_{out.stem}")
-    return out.parent / f"{stem}.json"
+    return content_dir / f"{stem}.json"
 
 
 def merge_content(previous: dict, addition: dict) -> dict:
@@ -1804,6 +1825,8 @@ def main() -> int:
                         help="daily=通常の1回、extra=同じ日の追加クラス（既存ファイルに合流する）、"
                              "review=金曜の週次復習")
     parser.add_argument("--history", type=Path, default=DEFAULT_HISTORY, help="履歴JSONのパス")
+    parser.add_argument("--root", type=Path, default=DEFAULT_ROOT,
+                        help="出力の置き場（既定：~/Documents/Claude-JP/漢字）")
     parser.add_argument("--content-out", type=Path,
                         help="コンテンツJSONの保存先（既定：out横のcontent_<date>.json）")
     parser.add_argument("--append", action="store_true",
@@ -1813,8 +1836,9 @@ def main() -> int:
 
     content = json.loads(args.content.read_text(encoding="utf-8"))
     day = content.get("date") or date.today().isoformat()
-    # 既定の置き場は週ごとのフォルダ（--history を別の場所に向けたときはその隣）。
-    out = args.out or day_page_path(day, args.history.parent)
+    # 既定の置き場は週ごとのフォルダ（--root を変えたときはその下）。履歴の場所とは
+    # 独立している：履歴はスキルフォルダ、ページは ~/Documents/Claude-JP/漢字。
+    out = args.out or day_page_path(day, args.root)
     content_out = args.content_out or content_json_path(out)
 
     # An extra class on a day that already has a page merges into it rather
@@ -1830,6 +1854,7 @@ def main() -> int:
         strokes, failed = load_strokes(content["kanji"], args.svg_cache)
 
     out.parent.mkdir(parents=True, exist_ok=True)
+    content_out.parent.mkdir(parents=True, exist_ok=True)
     content_out.write_text(json.dumps(content, ensure_ascii=False, indent=2), encoding="utf-8")
     out.write_text(build(content, strokes, str(content_out), f"{args.kind}:{day}"),
                    encoding="utf-8")

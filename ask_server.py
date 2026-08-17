@@ -20,8 +20,9 @@ import re
 import subprocess
 import sys
 import threading
+from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import build_page  # noqa: E402  (reuse the same CSS as 漢字練習_*.html for a consistent look)
@@ -185,14 +186,28 @@ def summary_prompt(content_file: str, summary_path: str, day: str,
     )
 
 
+def summary_target(content_file: str) -> tuple[str, str]:
+    """content_<date>.json の名前から (その日の日付, まとめの書き出し先) を決める。
+
+    まとめはPedroが読むページなので、その日の漢字練習ページと同じ週フォルダ
+    （~/Documents/Claude-JP/漢字/<週>/）に置く。**内容JSONの隣ではない**：内容JSONは
+    TCCの都合でスキルフォルダへ移してあり（build_page.DEFAULT_CONTENT_DIR）、
+    そこを基準にするとまとめまでスキルフォルダに紛れ込む。
+    日付として読めない名前のときは今日の日付にする（週フォルダの計算に日付が要るため）。
+    """
+    name_match = re.match(r"content_(\d{4}-\d{2}-\d{2})\.json$", Path(content_file).name)
+    day = name_match.group(1) if name_match else date.today().isoformat()
+    return day, str(build_page.day_page_path(day).parent / f"まとめ_{day}.html")
+
+
 def save_quiz_results(day: str, results: list[dict]) -> None:
     """Leave the day's quiz verdicts where the next build can pick them up.
 
-    kanji_history.json would be the natural home, but it lives in
-    ~/Documents/Claude-JP, which this process cannot write (see the note in
-    _handle_summarize). So the results are dropped in the skill folder and
-    build_page.ingest_quiz_results() folds them into the history on the next
-    daily run, which does have access.
+    kanji_history.json is the natural home and now sits in the skill folder,
+    within reach of this process — but the daily build rewrites that file whole,
+    so writing it from this always-on server would race that rewrite. The
+    results are dropped here instead and build_page.ingest_quiz_results() folds
+    them into the history on the next daily run.
 
     Best-effort: a failure here must not cost Pedro his まとめ, so it is
     reported and swallowed.
@@ -320,10 +335,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "今日のcontent JSONの場所が分かりませんでした。"})
             return
 
-        # content_<date>.json という命名規則から日付を取り出す（ファイルを開かずに済む）
-        name_match = re.match(r"content_(.+)\.json$", Path(content_file).name)
-        day = name_match.group(1) if name_match else "today"
-        summary_path = str(PurePosixPath(content_file).parent / f"まとめ_{day}.html")
+        # content_<date>.json という命名規則から日付と書き出し先を決める（ファイルを開かずに済む）
+        day, summary_path = summary_target(content_file)
 
         save_quiz_results(day, quiz_results)
 
