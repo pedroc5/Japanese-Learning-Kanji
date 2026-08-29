@@ -216,6 +216,10 @@ python3 ~/.claude/skills/kanji-practice/build_page.py "${KANJI_CONTENT_JSON:-/tm
 - 内容JSONのコピーをページと同じフォルダの `content_<date>.json` に自動保存し、
   `kanji_history.json` に今日の字・テーマを自動追記する（履歴の更新はスクリプトが自動でやるので、
   手作業でこのファイルを編集する必要はない）
+- **例文とクイズの全文をElevenLabsで読み上げ、mp3にしてページの隣に置く**（`tts.py`）。
+  例文の行頭の「・」がそのまま再生ボタン（▶）になり、クイズは問題文の前にボタンが付く。
+  鳴らすのはページに1つだけの`<audio>`で（`AUDIO_JS`）、別の文を押すと前の文は止まる。
+  詳しくは下の「音声（読み上げ）について」。
 - 溜まっているクイズの成績を `kanji_history.json` に取り込む（`ingest_quiz_results()`）。
   「まとめて」を押したときの正誤は `ask_server.py` がスキルフォルダの `.quiz_results/<date>.json`
   に置く。履歴ファイルは毎朝のビルドが丸ごと書き直すので、常駐サーバーが直接書くと競合する。
@@ -231,6 +235,9 @@ python3 ~/.claude/skills/kanji-practice/build_page.py "${KANJI_CONTENT_JSON:-/tm
 
 オプション:
 - `--skip-strokes`（筆順を読み込まない・テスト用）、`--svg-cache <dir>`、`--out <path>`
+- 音声まわり：`--no-audio`（読み上げを作らない）、`--voice <名前>`／`--voice-id <id>`、
+  `--tts-model <id>`、`--tts-format <fmt>`、`--tts-text kanji|kana`、`--tts-workers <n>`、
+  `--tts-cache <dir>`
 - **同じ日にもう1クラス追加で頼まれたとき** … その週のフォルダに `漢字練習_<date>.html` が既にあるかを確認し、
   あれば新しいファイルを作るのではなく、その日のページに**合流**させる：
   1. 新しいクラスの分だけ（テーマ・字10個・単語・クイズ）を通常通りJSONに書く（`date` は同じ日付のまま）。
@@ -242,6 +249,71 @@ python3 ~/.claude/skills/kanji-practice/build_page.py "${KANJI_CONTENT_JSON:-/tm
      「Aテーマ＋Bテーマ」のように連結）、同じ `漢字練習_<date>.html` を上書きする。既存ファイルが
      なければ通常の新規作成と同じ。**別ファイル（`_2`など）は作らない。**
   4. 履歴（`kanji_history.json`）もこの日1件のまま正しく更新される（重複警告は出ない）。
+
+### 6.5 音声（読み上げ）について
+
+例文とクイズ・練習問題には**音声の再生ボタン**が付く。読み上げは
+[ElevenLabs](https://elevenlabs.io/)、モデルは **Eleven v3**（`eleven_v3`）。
+実装は `tts.py`。**手で叩く必要はない** —
+`build_page.py` / `build_review.py` がページを書く前に自動で呼ぶ。
+
+- **ボイスは4つを混ぜる。** 既定は `Riku,Sakura,Kozy,Shizuka` で、**1文につき1声**が読む
+  （`assign_voices()`）。同じ声が最後まで続くページは単調で、同じ語を男女4人の声で聞くほうが
+  実際の日本語に近い。割り当ては文のハッシュで決めるので、**4等分に散らばりつつ、
+  作り直しても同じ文は同じ声**になる（`random()` だと作り直すたび全文キャッシュを外して
+  もう一度課金される）。再生ボタンにカーソルを乗せるとどの声か出る。
+  減らしたいときは `--voice Riku` のように使いたい声だけ渡す。
+  - Riku（男性）= `KJje3wzepLiSIQjVGCB6`、Sakura（女性）= `gHBfNp2PWSyFgpPlzCOd`、
+    Kozy（男性）= `GxxMAMfQkDlnqjpzjLHH`、Shizuka（女性）= `WQz3clzUdMqvBf0jswZQ`。
+    4つとも `tts.KNOWN_VOICES` にIDで書いてあるので、名前だけで検索なしに引ける。
+    **声を足すときはここにIDを書き、`DEFAULT_VOICE` にも名前を足す**（IDだけ足しても既定では使われない）。
+- **読み間違いを減らすために効いている3つのこと**（2026-08-29、「サイトのほうがうまく読む」
+  という指摘を追いかけて分かったもの。触るときはこの3つを崩さないこと）:
+  1. **`voice_settings` を送らない。** 送らなければAPIはそのボイス自身に保存された設定
+     （＝elevenlabs.ioのサイトが使うのと同じ設定）で読む。以前は
+     `{stability: .5, similarity_boost: .75}` を一律で送っていて、RikuとSakuraの
+     設定を上書きし、`style`・`speed`・`use_speaker_boost` も落としていた。
+     **これがサイトとの差の大half。**
+  2. **`language_code: "ja"` を送る。** 漢字だけの20字の文は日本語か中国語か本当に
+     曖昧で、指定しないとモデルが取り違えることがある（それが「読み間違い」に見える）。
+     v3はこれを尊重する。v2はフィールドを受け取るが無視する（API仕様）。
+  3. **モデルは `eleven_v3`。** v2は上の言語指定が効かない。
+- 使えないもの（v3が400を返す。試して確認済み）：`previous_text`／`next_text`（前後の文脈を
+  渡して繋がりを良くする機能）と `apply_language_text_normalization`。
+  つまりv3では**1文ずつ孤立して合成するしかない**ので、サイトに長文を貼ったときほどの
+  文脈は与えられない。ここが今も残っている差。
+- 1ページ分でおよそ **120文・1900文字**。ボイス・モデル・言語のどれかを変えると
+  キャッシュのキーが変わるので、そのぶん全文が作り直し＝再課金になる。
+- **無料プランではAPIから音声を作れない**（ライブラリのボイスが402で拒否される。
+  プリセットのRachelでも同じ）。有料プランが要る。
+
+- **APIキー** … `~/.claude/skills/kanji-practice/.elevenlabs_key` に1行で置く
+  （`$ELEVENLABS_API_KEY` でも読むが、launchdはPedroのシェルの環境変数を引き継がないので、
+  毎朝の自動実行に効くのはファイルのほうだけ）。gitignore済み。
+- **キーが無い・ネットが落ちている・ボイスが見つからないときは、音声なしでページを作る。**
+  再生ボタンが出ないだけで、ページ自体は今までどおり完成する。
+  「音声なし（…）」とその理由が出力に出るので、報告するときはそれを見る。
+  **音声が付かなかったことを理由にページ作りをやり直したり、失敗として報告したりしない。**
+- **キャッシュ** … 読み上げた文は `.tts_cache/` に文ごとに残る。同じ文は二度課金されないので、
+  同じ日の作り直し・`--append` の追加クラス・金曜の復習ページは無料で通る。
+  逆に**キャッシュを消すと次のビルドで作り直し＝creditsを使う**。消さないこと。
+- **mp3の置き場** … ページと同じ週フォルダの `漢字練習_<date>_audio/`（復習は `復習_<date>_audio/`）。
+  ページはこのフォルダを相対パスで参照するので、**HTMLだけを別の場所に移すと音が鳴らなくなる**
+  （フォルダごと動かせば鳴る）。1日ぶんで2MB前後。
+- **`--tts-text`** … 既定の `kanji` は文を漢字のまま送る（抑揚は自然だが、読みはモデル任せ）。
+  `kana` にするとふりがな通りのかなを送る（読みは確実だが、区切りが平板になりやすい）。
+  聞いてみて読み間違いが目立つようなら `kana` に切り替える。
+- **クイズの音声は答えを言ってしまう。** 読み方を問う問題を読み上げれば、それは答えそのもの。
+  Pedroが「例文も練習問題も再生できるように」と決めたのでそうしてあるが、
+  クイズのボタンは「ヒント」でもあることは意識しておく。
+  一方、復習ページの**書き取り問題のヒント**（`<details>`）と「読み／書き」のラベルは
+  読み上げから外してある（`speech_text()`）。
+- 手元で確認したいとき：
+
+  ```bash
+  python3 ~/.claude/skills/kanji-practice/tts.py --check          # キーとボイスの確認
+  python3 ~/.claude/skills/kanji-practice/tts.py --say "こんにちは" --out /tmp/a.mp3
+  ```
 
 ### 7. 金曜日は週次復習も作る
 
@@ -273,6 +345,8 @@ python3 ~/.claude/skills/kanji-practice/build_review.py
    - 出題する語は、上の一覧表に読み付きで載せた語を**避けて**選ぶ（`shown_words()` /
      `pick_words()`。他の字の行に載っている語も避ける）。語が少ない字だけ表の語に戻る。
      表記が同じで読みが2つある語（怒る＝おこる／いかる）は、答えが決まらないので出題しない。
+   - 練習問題にも日々のページと同じ**音声の再生ボタン**が付く（`復習_<date>_audio/`）。
+     「書き」のヒントとラベルは読み上げない。`--no-audio` で音声なしにできる。
    - `--no-writing` を付けると読みの問題だけになる。
 
 字と問題は**習った順ではなく、クイズで間違えた回数が多い順**に並ぶ（`quiz_priority()`）。
@@ -291,9 +365,22 @@ python3 ~/.claude/skills/kanji-practice/test_build_page.py
 ページ内の `<script>` が壊れても見た目は正常なまま採点だけ止まる、という失敗の仕方をするので、
 テストは埋め込んだJSのデータを読み戻して検査する。
 
+**手で `build_page.py` を試すときは、必ず本物のファイルから逃がすこと。**
+既定値のまま走らせると、`kanji_history.json` にテスト用の字と日付が入り、`.quiz_results/`
+に溜まっていた成績を食べて消し、`.tts_cache/` に嘘のmp3を書く（2026-08-29に実際にやった）。
+
+```bash
+python3 build_page.py test.json --skip-strokes \
+  --root /tmp/kanjitest --history /tmp/kanjitest/history.json \
+  --content-out /tmp/kanjitest/content.json --tts-cache /tmp/kanjitest/tts
+```
+
 ### 8. 報告する
 
 **チャットには読み方やクイズの解答を書かない。** 作ったHTMLのパスと、「今日のテーマは食べ物です（N4 3字／N3 5字／N2 2字）」程度の1〜2行だけ。金曜日に復習ページも作った場合はそのパスも一言添える。
+
+出力の `音声 N/M文` は報告に入れなくてよい。**音声なし**（キーが無い等）でもページは完成しているので、
+失敗として報告せず、作り直しもしない。Pedroが音声について聞いてきたときだけ理由を伝える。
 
 コマンドの出力にある `筆順 x/10字` を必ず確認する。10未満、または stderr に「警告」が出ていたら、その字はページに「筆順データを読めませんでした」というプレースホルダーが残っている状態なので、成功として報告しない。ネットワークを確認し、直してから再実行する。
 「履歴上すでに使用済みの字」という警告が出た場合は、選定ミスで既出の字を使ってしまったということなので、
@@ -309,6 +396,8 @@ Pedroにそのまま黙って進めず、次回から気をつける（同じ字
   場所が違うときは `--maker <path>`。SVGのダウンロードキャッシュも
   `~/.claude/skills/kanji-practice/.kanjivg_cache/` に置く（`--cache-dir`で変更可）。
 - `svgpathtools`, `Pillow`, `requests` が必要（conda環境 `kanji` に入っている）。
+  ただしこれは `kanji_gif.py` の話で、`build_page.py`・`build_review.py`・`tts.py` は
+  標準ライブラリだけで動く（毎朝の自動実行はシステムの python3）。
 - 平日（月〜金）9:00に launchd（`com.pedro.kanji-daily`）が自動実行する（時刻の実体は
   `com.pedro.kanji-daily.plist` の `StartCalendarInterval`）。Pedroが日中に追加のクラスを
   頼んできたときは、上記の `--kind extra --append` の手順でその日のページに合流させればよい

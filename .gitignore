@@ -13,6 +13,12 @@ kanji_history.json
 # その日の内容JSON。同じくTCCのためスキルフォルダに置く（ページ本体はDocumentsのまま）
 .content/
 
+# ElevenLabsのAPIキー。絶対に追跡しない（tts.KEY_FILE）
+.elevenlabs_key
+
+# 読み上げた文のmp3キャッシュ。作り直せる（が、作り直すとcreditsを使う）ので追跡はしない
+.tts_cache/
+
 # graphify の生成物（知識グラフ・キャッシュ・コスト記録）は作り直せるので追跡しない
 graphify-out/
 

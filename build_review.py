@@ -31,6 +31,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import build_page  # noqa: E402
+import tts  # noqa: E402
 from build_page import banner, esc, rich, word_ruby  # noqa: E402
 
 # 一覧表に読み付きで載せる語の数。ここに出した語は練習問題では避ける（答えが
@@ -224,7 +225,7 @@ def reading_question(entry: dict, word: dict) -> dict:
     """読み: the word in kanji, its meaning, and "how is it read?"."""
     gloss = gloss_of(word)
     return {
-        "q": f'<span class="qtag">読み</span>「<b>{esc(word["w"])}</b>」'
+        "q": f'<span class="qtag" data-nospeak>読み</span>「<b>{esc(word["w"])}</b>」'
              f'{f"（{rich(gloss)}）" if gloss else ""}の読み方は？',
         "a": re.sub(r"[()（）]", "", word["r"]),
         "alt": [],
@@ -242,7 +243,7 @@ def writing_question(entry: dict, word: dict) -> dict:
     """
     gloss = gloss_of(word)
     return {
-        "q": f'<span class="qtag write">書き</span>'
+        "q": f'<span class="qtag write" data-nospeak>書き</span>'
              f'「<b>{esc(re.sub(r"[()（）]", "", word["r"]))}</b>」'
              f'{f"（{rich(gloss)}）" if gloss else ""}を漢字で書きましょう。'
              f'<details class="hint"><summary>ヒント</summary>'
@@ -290,6 +291,16 @@ def main() -> int:
                         help="出力HTML（既定：<root>/<その週>/復習_<date>.html）")
     parser.add_argument("--no-writing", action="store_true",
                         help="書き取り問題を作らない（読みの問題だけにする）")
+    parser.add_argument("--no-audio", action="store_true",
+                        help="音声を作らない（練習問題の再生ボタンが出ない）")
+    parser.add_argument("--voice", default=tts.DEFAULT_VOICE)
+    parser.add_argument("--voice-id", default="")
+    parser.add_argument("--tts-model", default=tts.DEFAULT_MODEL)
+    parser.add_argument("--tts-format", default=tts.DEFAULT_FORMAT)
+    parser.add_argument("--tts-text", choices=["kanji", "kana"], default="kanji")
+    parser.add_argument("--tts-workers", type=int, default=tts.DEFAULT_WORKERS)
+    parser.add_argument("--tts-cache", type=Path, default=tts.CACHE_DIR)
+    parser.add_argument("--tts-language", default=tts.DEFAULT_LANGUAGE)
     args = parser.parse_args()
 
     monday, sunday = week_range(date.fromisoformat(args.date))
@@ -327,6 +338,22 @@ def main() -> int:
         "quiz": quiz,
     }
 
+    # 練習問題の音声。出力先が決まっていないとmp3の置き場も決まらないので、
+    # 節を組み立てる前にページのパスを確定させる（日々のページと同じ週フォルダ）。
+    out = args.out or (args.root / build_page.week_folder(args.date)
+                       / f"復習_{args.date}.html")
+    audio, audio_note = {}, ""
+    if not args.no_audio:
+        say = build_page.speech_kana if args.tts_text == "kana" else build_page.speech_text
+        wanted: dict[str, str] = {}
+        for question in quiz:
+            wanted.setdefault(build_page.speech_text(question["q"]), say(question["q"]))
+        urls, audio_note = tts.speak_page(
+            list(wanted.values()), out, voice=args.voice, voice_id=args.voice_id,
+            model=args.tts_model, fmt=args.tts_format, workers=args.tts_workers,
+            cache_dir=args.tts_cache, language=args.tts_language)
+        audio = {key: urls[said] for key, said in wanted.items() if said in urls}
+
     sections = [
         banner("今週習った漢字（一覧）"),
         build_page.collapsible(
@@ -341,16 +368,16 @@ def main() -> int:
         build_page.quiz_section(
             quiz, [question["char"] for question in quiz],
             heading=f"今週の練習問題（{len(quiz)}問）"
-                    f"／「読み」はひらがな、「書き」は漢字で答えます"),
+                    f"／「読み」はひらがな、「書き」は漢字で答えます",
+            audio=audio),
         "",
     ]
 
-    # 日々のページと同じ、その週のフォルダに置く。
-    out = args.out or (args.root / build_page.week_folder(args.date)
-                       / f"復習_{args.date}.html")
+    # 置き場は日々のページと同じ、その週のフォルダ（out は音声より前に決めてある）。
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(build_page.build(merged_content, {}, page_id=f"review:{args.date}",
-                                    sections=sections, heading="漢字の復習", period="今週"),
+                                    sections=sections, heading="漢字の復習", period="今週",
+                                    audio=audio),
                    encoding="utf-8")
 
     build_page.update_history(history, merged_content, "review", args.date, str(out))
@@ -359,6 +386,8 @@ def main() -> int:
     size = out.stat().st_size // 1024
     print(f"完了：{out}（{len(used_dates)}日分・{len(merged_kanji)}字・"
           f"練習 {len(quiz)}問〔うち書き取り {writing_count}問〕・{size}KB）")
+    if audio_note:
+        print(f"  {audio_note}")
     if graded:
         print(f"  クイズの成績 {graded} 問分を履歴に記録しました")
     if missed:

@@ -19,12 +19,14 @@ import json
 import re
 import sys
 import unittest
+import urllib.parse
 from html.parser import HTMLParser
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import build_page  # noqa: E402
 import build_review  # noqa: E402
+import tts  # noqa: E402
 
 
 def sample_content() -> dict:
@@ -464,7 +466,7 @@ class WeeklyReviewTest(unittest.TestCase):
         self.assertEqual([q["char"] for q in quiz], ["雷", "雷", "雷", "虹"])
         self.assertEqual([("ph" in q) for q in quiz], [False, False, True, False])
         self.assertEqual([q["a"] for q in quiz], ["らくらい", "かみなりがなる", "雷鳴", "にじ"])
-        self.assertTrue(quiz[0]["q"].startswith('<span class="qtag">読み</span>'))
+        self.assertTrue(quiz[0]["q"].startswith('<span class="qtag" data-nospeak>読み</span>'))
 
     # --- ページ全体 -------------------------------------------------------- #
 
@@ -580,6 +582,284 @@ class SummaryTargetTest(unittest.TestCase):
         day, target = ask_server.summary_target("/somewhere/content_notadate.json")
         self.assertEqual(day, date.today().isoformat())
         self.assertIn(f"まとめ_{date.today().isoformat()}.html", target)
+
+
+class SpeechTextTest(unittest.TestCase):
+    """What actually gets read aloud. Getting this wrong is expensive twice
+    over: a bad clip is wrong in Pedro's ear and already paid for."""
+
+    def test_furigana_is_not_read_a_second_time(self):
+        spoken = build_page.speech_text(
+            "<b><ruby>宿泊<rt>しゅくはく</rt></ruby></b>する。")
+        self.assertEqual(spoken, "宿泊する。")
+
+    def test_punctuation_survives(self):
+        """plain_sentence() drops 。and 、 to compare sentences; the voice needs
+        them to phrase one."""
+        self.assertEqual(build_page.speech_text("行く、そして<b>泊</b>まる。"),
+                         "行く、そして泊まる。")
+        self.assertNotIn("。", build_page.plain_sentence("行く、そして泊まる。"))
+
+    def test_a_folded_hint_is_never_spoken(self):
+        """The weekly 書き question hides which kanji to use. Reading the hint
+        out loud would hand over exactly what the fold withholds."""
+        question = build_review.writing_question(
+            {"char": "泊", "meaning": "とまる"},
+            {"w": "宿泊", "r": "しゅくはく", "m": "とまること", "e": "lodging"})
+        spoken = build_page.speech_text(question["q"])
+        self.assertIn("しゅくはく", spoken)
+        self.assertNotIn("泊", spoken)
+        self.assertNotIn("ヒント", spoken)
+
+    def test_the_question_label_is_not_read_aloud(self):
+        """「読み」/「書き」 are badges on the exercise, not part of the sentence;
+        a clip that opens by announcing them is noise."""
+        question = build_review.reading_question(
+            {"char": "雷", "meaning": "かみなり"},
+            {"w": "落雷", "r": "らくらい", "m": "かみなりが落ちること", "e": "lightning strike"})
+        self.assertIn("読み", question["q"])                       # 画面には出る
+        self.assertTrue(build_page.speech_text(question["q"]).startswith("「落雷」"))
+
+    def test_kana_mode_reads_the_furigana_instead_of_the_kanji(self):
+        sentence = "<ruby>京都<rt>きょうと</rt></ruby>に<b><ruby>一泊<rt>いっぱく</rt></ruby></b>した。"
+        self.assertEqual(build_page.speech_kana(sentence), "きょうとにいっぱくした。")
+        self.assertEqual(build_page.speech_text(sentence), "京都に一泊した。")
+
+    def test_an_empty_reading_keeps_the_word(self):
+        """カタカナ語 are written <ruby>ホテル<rt></rt></ruby> in the content JSON."""
+        self.assertEqual(build_page.speech_kana("<ruby>ホテル<rt></rt></ruby>に泊まる。"),
+                         "ホテルに泊まる。")
+
+    def test_both_modes_agree_on_the_lookup_key(self):
+        """audio_button() keys on speech_text() whichever text was spoken, so a
+        page built with --tts-text kana still finds its clips."""
+        sentence = "<ruby>虹<rt>にじ</rt></ruby>が出た。"
+        audio = {build_page.speech_text(sentence): {"src": "x_audio/abc.mp3"}}
+        self.assertIn("abc.mp3", build_page.audio_button(sentence, audio))
+
+
+class AudioButtonTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.content = sample_content()
+        self.audio = {build_page.speech_text(text):
+                      {"src": f"漢字練習_2026-08-02_audio/{i:02d}.mp3",
+                       "voice": "Riku" if i % 2 else "Sakura"}
+                      for i, text in enumerate(build_page.page_sentences(self.content))}
+        self.page = build_page.build(self.content, {"雷": SAMPLE_STROKES, "虹": None},
+                                     page_id="daily:2026-08-02", audio=self.audio)
+
+    def test_every_example_and_question_gets_a_button(self):
+        self.assertEqual(markup(self.page).count('class="play"'),
+                         len(build_page.page_sentences(self.content)))
+
+    def test_the_button_takes_the_bullet_position(self):
+        """The play button replaces the ・ rather than being added next to it,
+        so a page with audio lines up exactly like one without."""
+        example = self.content["kanji"][0]["examples"][0]
+        section = build_page.kanji_section(1, self.content["kanji"][0],
+                                           SAMPLE_STROKES, self.audio)
+        self.assertIn(f'>▶</button>{example}', section)
+        self.assertNotIn(f'<p class="ex">・{example}', section)
+
+    def test_the_voice_name_is_shown_beside_the_button(self):
+        """Four voices take turns through the page. The name is on the page, in
+        front of the ▶ — not only in a tooltip, which Pedro can't read off."""
+        section = build_page.kanji_section(1, self.content["kanji"][0],
+                                           SAMPLE_STROKES, self.audio)
+        self.assertIn('<i class="voice">(Sakura)</i><button', section)
+        self.assertNotIn("title=", section)
+        self.assertIn('aria-label="音声を聞く（Sakura）"', section)
+
+    def test_a_sentence_without_a_clip_keeps_its_bullet(self):
+        """One failed synthesis costs that sentence its button, nothing else."""
+        partial = dict(list(self.audio.items())[1:])
+        section = build_page.kanji_section(1, self.content["kanji"][0],
+                                           SAMPLE_STROKES, partial)
+        self.assertIn('<p class="ex">・', section)
+        self.assertNotIn('class="play"', section)
+
+    def test_a_page_without_audio_is_unchanged(self):
+        silent = build_page.build(self.content, {"雷": SAMPLE_STROKES, "虹": None},
+                                  page_id="daily:2026-08-02")
+        self.assertNotIn('class="play"', markup(silent))
+        self.assertIn('<p class="ex">・', silent)
+
+    def test_the_markup_stays_balanced_with_buttons(self):
+        parser = TagBalance()
+        parser.feed(markup(self.page))
+        self.assertEqual(parser.errors, [])
+
+    def test_the_player_script_is_always_present(self):
+        """One shared <audio>, not one per sentence — see AUDIO_JS."""
+        self.assertIn("button.play", self.page)
+        self.assertNotIn("<audio", markup(self.page))
+
+    def test_the_weekly_exercises_are_playable(self):
+        quiz = build_review.exercises(sample_content()["kanji"])
+        audio = {build_page.speech_text(q["q"]): {"src": "復習_audio/a.mp3", "voice": "Riku"}
+                 for q in quiz}
+        section = build_page.quiz_section(quiz, [q["char"] for q in quiz], audio=audio)
+        self.assertEqual(section.count('class="play"'), len(quiz))
+
+
+class TTSCacheTest(unittest.TestCase):
+    """The cache is what keeps a rerun free, so it has to key on everything
+    that changes the audio and on nothing that doesn't."""
+
+    def setUp(self) -> None:
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_the_key_covers_voice_model_format_and_language(self):
+        base = tts.cache_key("こんにちは", "V1", "eleven_v3", "mp3_44100_64")
+        self.assertNotEqual(base, tts.cache_key("こんばんは", "V1", "eleven_v3", "mp3_44100_64"))
+        self.assertNotEqual(base, tts.cache_key("こんにちは", "V2", "eleven_v3", "mp3_44100_64"))
+        self.assertNotEqual(base, tts.cache_key("こんにちは", "V1", "eleven_v2", "mp3_44100_64"))
+        self.assertNotEqual(base, tts.cache_key("こんにちは", "V1", "eleven_v3", "mp3_22050_32"))
+        self.assertNotEqual(base, tts.cache_key("こんにちは", "V1", "eleven_v3",
+                                                "mp3_44100_64", "zh"))
+        self.assertEqual(base, tts.cache_key("こんにちは", "V1", "eleven_v3", "mp3_44100_64"))
+
+    def test_the_voices_own_settings_are_left_alone(self):
+        """Omitting voice_settings makes the API use the settings stored on the
+        voice — the ones elevenlabs.io plays it with. Sending our own generic
+        pair overrode them, and that was audible."""
+        sent = {}
+        def capture(path, key, *, body=None, **kwargs):
+            sent.update(body or {})
+            return b"ID3"
+        original, tts._request = tts._request, capture
+        self.addCleanup(lambda: setattr(tts, "_request", original))
+        tts.synthesize("文。", "V1", "key", cache_dir=self.dir)
+        self.assertNotIn("voice_settings", sent)
+        self.assertEqual(sent["language_code"], "ja")   # 日本語だと明示する
+
+    def test_a_cached_sentence_never_reaches_the_network(self):
+        name = tts.cache_key("ある文", "V1", "M", "F")
+        (self.dir / f"{name}.mp3").write_bytes(b"ID3cached")
+        def explode(*args, **kwargs):
+            raise AssertionError("キャッシュがあるのにAPIを呼んだ")
+        original, tts._request = tts._request, explode
+        self.addCleanup(lambda: setattr(tts, "_request", original))
+        clips, failed = tts.synthesize_all({"ある文": "V1"}, "key",
+                                           model="M", fmt="F", cache_dir=self.dir)
+        self.assertEqual(clips, {"ある文": b"ID3cached"})
+        self.assertEqual(failed, [])
+
+    def test_one_failure_does_not_lose_the_other_clips(self):
+        calls = []
+        def flaky(path, key, **kwargs):
+            calls.append(path)
+            if "だめ" in (kwargs.get("body") or {}).get("text", ""):
+                raise tts.TTSError("422")
+            return b"ID3ok"
+        original, tts._request = tts._request, flaky
+        self.addCleanup(lambda: setattr(tts, "_request", original))
+        clips, failed = tts.synthesize_all({"よい文": "V1", "だめな文": "V1"}, "key",
+                                           cache_dir=self.dir, workers=1)
+        self.assertEqual(list(clips), ["よい文"])
+        self.assertEqual(failed, ["だめな文"])
+
+    def test_a_bad_key_stops_the_batch_instead_of_repeating(self):
+        """A wrong key fails identically on every sentence. One page is ~120 of
+        them, so the first authentication error has to end the run."""
+        tried = []
+        def unauthorized(path, key, **kwargs):
+            tried.append(path)
+            # 実際に返ってきたもの：無料プランはAPIからライブラリのボイスを使えない。
+            raise tts.TTSError('HTTP 402: {"detail":{"code":"paid_plan_required"}}')
+        original, tts._request = tts._request, unauthorized
+        self.addCleanup(lambda: setattr(tts, "_request", original))
+        clips, failed = tts.synthesize_all({f"文{i}。": "V1" for i in range(20)}, "bad",
+                                           cache_dir=self.dir, workers=1)
+        self.assertEqual(clips, {})
+        self.assertEqual(len(failed), 20)          # 全文が音声なしとして扱われる
+        self.assertLess(len(tried), 20)            # が、20回は呼ばない
+
+    def test_a_known_voice_needs_no_lookup(self):
+        """Riku と Sakura は id が分かっているので、9時のビルドがボイス検索の
+        失敗でまるごと無音になることがない。"""
+        def explode(*args, **kwargs):
+            raise AssertionError("既知のボイスなのにAPIを呼んだ")
+        original, tts._request = tts._request, explode
+        self.addCleanup(lambda: setattr(tts, "_request", original))
+        self.assertEqual(tts.resolve_voice("Riku", "key", self.dir),
+                         tts.KNOWN_VOICES["riku"])
+        self.assertEqual(tts.resolve_voice("sakura", "key", self.dir),
+                         tts.KNOWN_VOICES["sakura"])
+        self.assertEqual(tts.resolve_voice(tts.KNOWN_VOICES["riku"], "key", self.dir),
+                         tts.KNOWN_VOICES["riku"])
+
+    def test_clips_land_beside_the_page_with_an_encoded_url(self):
+        """The week folder has Japanese in its name and the page is opened over
+        file://, so the src has to be percent-encoded to resolve."""
+        page = self.dir / "2026-08-03〜08-09" / "漢字練習_2026-08-05.html"
+        urls = tts.write_clips({"文です。": b"ID3"}, tts.audio_dir_for(page),
+                               {"文です。": ("Riku", "V1")}, "M", "F")
+        src = urls["文です。"]["src"]
+        self.assertNotIn("漢字", src)
+        self.assertTrue(src.startswith("%"), src)
+        self.assertTrue((page.parent / urllib.parse.unquote(src)).exists())
+
+    def test_the_same_sentence_is_one_file(self):
+        page = self.dir / "p.html"
+        pairs = {"同じ文。": ("Riku", "V1")}
+        urls = tts.write_clips({"同じ文。": b"a"}, tts.audio_dir_for(page), pairs, "M", "F")
+        tts.write_clips({"同じ文。": b"a"}, tts.audio_dir_for(page), pairs, "M", "F")
+        self.assertEqual(len(list(tts.audio_dir_for(page).glob("*.mp3"))), 1)
+        self.assertIn(tts.cache_key("同じ文。", "V1", "M", "F")[:12], urls["同じ文。"]["src"])
+
+    def test_the_voices_split_the_page_about_evenly(self):
+        voices = [(name, name[0]) for name in ("Riku", "Sakura", "Kozy", "Shizuka")]
+        texts = [f"これは{i}番目の文です。" for i in range(400)]
+        picked = tts.assign_voices(texts, voices)
+        for name, _ in voices:
+            share = sum(1 for v in picked.values() if v[0] == name)
+            self.assertGreater(share, 60, f"{name} が少なすぎる")
+            self.assertLess(share, 140, f"{name} が多すぎる")
+
+    def test_all_four_voices_are_known_without_a_lookup(self):
+        """既定の4声。名前で引けないと、9時のビルドがボイス検索の失敗で無音になる。"""
+        def explode(*args, **kwargs):
+            raise AssertionError("既知のボイスなのにAPIを呼んだ")
+        original, tts._request = tts._request, explode
+        self.addCleanup(lambda: setattr(tts, "_request", original))
+        names = [n.strip() for n in tts.DEFAULT_VOICE.split(",")]
+        self.assertEqual(names, ["Riku", "Sakura", "Kozy", "Shizuka"])
+        ids = {tts.resolve_voice(name, "key", self.dir) for name in names}
+        self.assertEqual(len(ids), 4)                     # 4声とも別のID
+
+    def test_the_same_sentence_always_gets_the_same_voice(self):
+        """random() would reshuffle every rebuild, and a reshuffled page misses
+        the cache on all 120 clips — i.e. pays for them again."""
+        voices = [("Riku", "R"), ("Sakura", "S")]
+        first = tts.assign_voices(["雨が降る。", "虹が出た。"], voices)
+        second = tts.assign_voices(["虹が出た。", "雨が降る。"], voices)
+        self.assertEqual(first, second)
+
+    def test_one_voice_reads_everything(self):
+        picked = tts.assign_voices(["あ。", "い。", "う。"], [("Riku", "R")])
+        self.assertEqual({v[0] for v in picked.values()}, {"Riku"})
+
+    def test_no_key_means_a_silent_page_not_a_failed_build(self):
+        """9:00 with no key has to still produce a page."""
+        urls, note = tts.speak_page(["文。"], self.dir / "p.html",
+                                    key_file=self.dir / "missing", cache_dir=self.dir)
+        self.assertEqual(urls, {})
+        self.assertIn("音声なし", note)
+
+    def test_the_key_file_wins_over_the_environment(self):
+        import os
+        key_file = self.dir / ".elevenlabs_key"
+        key_file.write_text("from-file\n")
+        original = os.environ.get(tts.KEY_ENV)
+        os.environ[tts.KEY_ENV] = "from-env"
+        self.addCleanup(lambda: os.environ.pop(tts.KEY_ENV, None)
+                        if original is None else os.environ.__setitem__(tts.KEY_ENV, original))
+        self.assertEqual(tts.load_key(key_file), "from-file")
+        self.assertEqual(tts.load_key(self.dir / "missing"), "from-env")
 
 
 if __name__ == "__main__":

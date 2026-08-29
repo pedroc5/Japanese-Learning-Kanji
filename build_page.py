@@ -14,6 +14,12 @@ week_folder()). The content JSON behind each page is the one piece kept out of
 there, in the skill folder, because launchd has to read it back (see
 DEFAULT_CONTENT_DIR).
 
+The page carries its own CSS and JS, but no longer its own audio: the spoken
+example and quiz sentences are mp3s in a 漢字練習_<date>_audio/ folder beside
+it (see tts.py). Inlining ~120 clips as data URIs would have taken the page
+from 140KB to several MB. Move the HTML on its own and the play buttons go
+quiet; the rest of the page still works.
+
 See SKILL.md for the JSON schema.
 """
 
@@ -28,6 +34,8 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import date, timedelta
 from pathlib import Path
+
+import tts
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_SVG_CACHE = HERE / ".kanjivg_cache"
@@ -130,6 +138,18 @@ CSS = """
   p{margin:0 0 8px}
   .en{color:var(--grey); font-size:14px}
   .ex{margin:0 0 4px 18px}
+  /* 音声の再生ボタン。例文では「・」の位置にそのまま置き換わるので、行頭は揃ったまま。 */
+  /* 声の名前。幅を固定して右寄せにしてあるので、名前の長さが違っても▶の位置は揃う。 */
+  .voice{font-style:italic; font-size:12px; color:var(--grey); user-select:none;
+         display:inline-block; min-width:5.2em; text-align:right; margin-right:4px}
+  .play{font-family:inherit; font-size:11px; line-height:1; color:var(--navy);
+        background:#fff; border:1px solid var(--border); border-radius:50%;
+        width:20px; height:20px; padding:0; margin-right:5px; cursor:pointer;
+        vertical-align:middle; flex:0 0 auto}
+  .play:hover{background:var(--light); border-color:var(--navy)}
+  .play.on{background:var(--navy); border-color:var(--navy); color:#fff}
+  .play.err{border-color:var(--accent); color:var(--accent)}
+  .play:disabled{opacity:.5; cursor:default}
   .box{background:var(--light); border-left:4px solid #7c93ad; padding:14px 18px;
        margin:10px 0 16px; border-radius:0 4px 4px 0}
   .box.warm{background:var(--peach); border-left-color:var(--accent)}
@@ -287,6 +307,7 @@ CSS = """
     .page{display:block}
     .chatbox{display:none}
     .summarize-box{display:none}
+    .play, .voice{display:none}
     .wrap{box-shadow:none; padding:0; max-width:none}
     details{display:block}
     details > *{display:block !important}
@@ -729,6 +750,49 @@ FURIGANA_JS = """
   if (!btn) return;
   btn.addEventListener("click", function(){
     document.body.classList.toggle("furigana-on");
+  });
+})();
+</script>
+"""
+
+
+AUDIO_JS = """
+<script>
+/* 例文・クイズの音声（ElevenLabs、ビルド時に作ったmp3がページの隣のフォルダにある）。
+
+   再生用の<audio>はページに1つだけ。文ごとに<audio>を置くと、この規模のページでは
+   100個以上になり、Safariが同時に持てる音声要素の上限に当たって後半が鳴らなくなる。
+   1つを使い回して src を差し替えるだけなら、鳴っているのは常に1文で、前の文は
+   自動的に止まる（読み上げが重なると聞き分けられないので、そのほうが都合もよい）。 */
+(function(){
+  var player = new Audio();
+  var current = null;
+
+  function stop(){
+    player.pause();
+    if (current) { current.classList.remove("on"); current.textContent = "▶"; }
+    current = null;
+  }
+
+  player.addEventListener("ended", stop);
+
+  document.addEventListener("click", function(event){
+    var btn = event.target.closest ? event.target.closest("button.play") : null;
+    if (!btn) return;
+    event.preventDefault();
+    if (btn === current) { stop(); return; }   /* 同じボタンをもう一度押したら止める */
+    stop();
+    current = btn;
+    btn.classList.add("on");
+    btn.textContent = "■";
+    player.src = btn.getAttribute("data-src");
+    player.play().catch(function(){
+      /* file:// で開いた隣のフォルダが無い・移動された等。ページは黙って壊れるより、
+         そのボタンだけを「鳴らない」印にして残す。 */
+      stop();
+      btn.classList.add("err");
+      btn.title = "音声を読み込めませんでした（ページと同じ場所の _audio フォルダを確認してください）";
+    });
   });
 })();
 </script>
@@ -1433,11 +1497,14 @@ def word_table_html(words: list[dict]) -> str:
     ])
 
 
-def kanji_section(i: int, kanji: dict, stroke_data: dict | None) -> str:
+def kanji_section(i: int, kanji: dict, stroke_data: dict | None,
+                  audio: dict[str, str] | None = None) -> str:
     """One kanji's block: heading, readings, stroke-order drawing, words, examples.
 
     `i` is the 1-based position used in the heading. `stroke_data` is this
     character's KanjiVG paths (or None when they couldn't be loaded).
+    `audio` maps a sentence (as speech_text() sees it) to its mp3 beside the
+    page; sentences missing from it simply keep their plain bullet.
     """
     char = kanji["char"]
     level = kanji.get("level", "N3").upper()
@@ -1473,7 +1540,9 @@ def kanji_section(i: int, kanji: dict, stroke_data: dict | None) -> str:
     parts.append("")
 
     for example in kanji.get("examples", []):
-        parts.append(f'<p class="ex">・{example}</p>')  # 例文は <b> や <ruby> を含むので escape しない
+        # 音声があれば行頭の「・」がそのまま再生ボタンになる（無ければ今までどおり「・」）。
+        # 例文は <b> や <ruby> を含むので escape しない。
+        parts.append(f'<p class="ex">{audio_button(example, audio) or "・"}{example}</p>')
     return collapsible(heading, "\n".join(parts).rstrip())
 
 
@@ -1509,6 +1578,86 @@ def plain_sentence(text: str) -> str:
     return text.strip("。．.！!？?、,")
 
 
+def speech_text(text: str) -> str:
+    """A sentence as it should be *heard*: markup and furigana gone, punctuation
+    kept.
+
+    plain_sentence() strips the punctuation too, because it is comparing two
+    sentences for sameness. Here the 。and 、are what tell the voice where to
+    breathe, so they stay. The <rt> readings go — they are a second copy of the
+    same words, and read aloud they would double every kanji.
+
+    A folded <details> is dropped whole, not just unwrapped: on the weekly page
+    the 書き questions hide "「泊」を使います" in one, and a clip that read the
+    hint out loud would hand over the answer the fold exists to withhold.
+
+    So is anything marked data-nospeak — the 読み／書き badges on the weekly
+    exercises are labels on the question, not part of it, and a clip that opens
+    by announcing "書き" before the sentence is just noise in the ear.
+
+    This is also the key the audio map is filed under, so a sentence gets one
+    clip however it happens to be marked up.
+    """
+    text = re.sub(r"<details.*?</details>", "", str(text), flags=re.S)
+    text = re.sub(r"<(\w+)[^>]*\bdata-nospeak\b[^>]*>.*?</\1>", "", text, flags=re.S)
+    text = re.sub(r"<rt>.*?</rt>", "", str(text), flags=re.S)
+    text = re.sub(r"<[^>]+>", "", text)
+    return html.unescape(text).strip()
+
+
+def speech_kana(text: str) -> str:
+    """The same sentence as pure kana, read off the furigana.
+
+    The alternative to speech_text() for --tts-text kana. Sending the kanji
+    lets the voice phrase the sentence naturally but leaves the reading up to
+    its own guess, which on a kanji practice page is the one thing that must
+    not be wrong. Sending the furigana instead makes the reading exactly the
+    one written on the page, at the cost of the voice having to re-find the
+    word boundaries in an unbroken kana string.
+
+    A <ruby> with an empty <rt> (カタカナ語 written that way in the content
+    JSON) keeps its base text.
+    """
+    text = re.sub(r"<ruby>(.*?)<rt>(.*?)</rt></ruby>",
+                  lambda m: m.group(2) or m.group(1), str(text), flags=re.S)
+    return speech_text(text)
+
+
+def audio_button(text: str, audio: dict[str, dict] | None) -> str:
+    """The play button for one sentence, or "" when it has no clip.
+
+    Empty is the normal case whenever audio is off (no API key, --no-audio) or
+    that one sentence failed to synthesize, and it has to stay cheap: callers
+    fall back to the plain ・ bullet, so a page without audio looks exactly
+    like the pages did before it existed.
+
+    The voice's name sits in front of the button, in italics and brackets.
+    Four voices take turns through a page, and a name only visible on hover is
+    a name Pedro can't use — he'd hear that two clips differ without being able
+    to say which reader he preferred. It is fixed-width and right-aligned so
+    the ▶ buttons still line up in a column whether the reader is Riku or
+    Shizuka.
+    """
+    clip = (audio or {}).get(speech_text(text))
+    if not clip:
+        return ""
+    src = clip["src"] if isinstance(clip, dict) else clip
+    voice = clip.get("voice", "") if isinstance(clip, dict) else ""
+    name = f'<i class="voice">({esc(voice)})</i>' if voice else ""
+    label = f"音声を聞く（{voice}）" if voice else "音声を聞く"
+    return (f'{name}<button type="button" class="play" data-src="{attr_esc(src)}"'
+            f' aria-label="{attr_esc(label)}">▶</button>')
+
+
+def page_sentences(content: dict) -> list[str]:
+    """Every sentence on a page that gets a play button, in page order:
+    each kanji's examples, then the quiz questions."""
+    sentences = [ex for entry in content.get("kanji", [])
+                 for ex in entry.get("examples", [])]
+    sentences += [question.get("q", "") for question in content.get("quiz", [])]
+    return sentences
+
+
 def reused_examples(content: dict) -> list[str]:
     """Quiz questions that are just one of the day's example sentences again.
 
@@ -1534,7 +1683,8 @@ def reused_examples(content: dict) -> list[str]:
 
 
 def quiz_section(quiz: list[dict], chars: list[str],
-                 heading: str = "復習クイズ(読み方をひらがなで書いてください)") -> str:
+                 heading: str = "復習クイズ(読み方をひらがなで書いてください)",
+                 audio: dict[str, str] | None = None) -> str:
     """The review quiz: input per question, a collapsible answer list, and the
     answer key as JS data for the in-page "answer check" button.
 
@@ -1545,6 +1695,11 @@ def quiz_section(quiz: list[dict], chars: list[str],
     An entry may also carry "ph", the input's placeholder. It defaults to
     ひらがなで入力 because nearly every question asks for a reading; the weekly
     page's 書き取り questions want 漢字で入力 instead.
+
+    `audio` maps a question sentence to its mp3, adding a play button in front
+    of it. Note that hearing the question read aloud gives away the reading it
+    is asking for; that is deliberate — Pedro asked for the exercises to be
+    playable — but it means the button is a hint, not just an aid.
 
     `heading` names the section — the weekly page's list is not only readings,
     so it says so. The section is returned already wrapped in its foldable
@@ -1563,7 +1718,7 @@ def quiz_section(quiz: list[dict], chars: list[str],
     question_items, answer_items, answer_key = [], [], []
     for i, question in enumerate(quiz):
         question_items.append(
-            f'  <li>{question["q"]}\n'
+            f'  <li>{audio_button(question["q"], audio)}{question["q"]}\n'
             f'    <div class="qline"><input class="ans" data-q="{i}"'
             f' placeholder="{attr_esc(question.get("ph", "ひらがなで入力"))}">'
             f'<span class="res" data-r="{i}"></span></div></li>')
@@ -1574,6 +1729,7 @@ def quiz_section(quiz: list[dict], chars: list[str],
             js_str([question["a"]]),
             js_str(question.get("alt", [])),
             js_str(rich(note)),                      # innerHTML に入るのでHTMLエスケープしてから
+                                                     # （ふりがな付きの場合はそのまま渡す）
             js_str(chars[i] if i < len(chars) else ""),
         ))
     body = """<p class="en">下の欄に入力して、「答え合わせ」ボタンを押すと、正しいか正しくないかを説明します。</p>
@@ -1662,7 +1818,8 @@ def level_summary(kanji: list[dict]) -> str:
 
 def build(content: dict, strokes: dict[str, dict | None], content_file: str = "",
           page_id: str = "", sections: list[str] | None = None,
-          heading: str = "漢字練習", period: str = "今日") -> str:
+          heading: str = "漢字練習", period: str = "今日",
+          audio: dict[str, str] | None = None) -> str:
     """Assemble the whole self-contained practice page and return it as HTML.
 
     `strokes` maps character -> KanjiVG stroke data (or None when it couldn't
@@ -1679,6 +1836,9 @@ def build(content: dict, strokes: dict[str, dict | None], content_file: str = ""
     same furigana toggle, same drafts, same chat and まとめ wiring.
     `heading` is the <h1> and the browser title, `period` the word the intro
     box uses for what the page covers (今日 / 今週).
+    `audio` maps each sentence to the mp3 written beside the page (see tts.py);
+    empty or None simply means no play buttons, which is what every page looked
+    like before the voice was added.
 
     The page is emitted indented and commented, so it can be read (and diffed)
     as HTML rather than only viewed in a browser.
@@ -1692,10 +1852,11 @@ def build(content: dict, strokes: dict[str, dict | None], content_file: str = ""
         for i, entry in enumerate(content["kanji"], 1):
             level = entry.get("level", "N3").upper()
             sections += [banner(f'{i}. {entry["char"]}（{level}）'),
-                         kanji_section(i, entry, strokes.get(entry["char"])), ""]
+                         kanji_section(i, entry, strokes.get(entry["char"]), audio), ""]
         sections += [banner("復習クイズ"),
                      quiz_section(content["quiz"],
-                                  quiz_chars(content["quiz"], content["kanji"])), ""]
+                                  quiz_chars(content["quiz"], content["kanji"]),
+                                  audio=audio), ""]
 
     # KanjiVG is credited where its data is actually embedded, so the review
     # page — which draws no strokes — doesn't claim to use it.
@@ -1758,6 +1919,7 @@ def build(content: dict, strokes: dict[str, dict | None], content_file: str = ""
         CHAT_RESIZE_JS,
         SUMMARIZE_JS,
         FURIGANA_JS,
+        AUDIO_JS,
         "</body>",
         "</html>",
         "",
@@ -1833,6 +1995,25 @@ def main() -> int:
                         help="出力の置き場（既定：~/Documents/Claude-JP/漢字）")
     parser.add_argument("--content-out", type=Path,
                         help="コンテンツJSONの保存先（既定：out横のcontent_<date>.json）")
+    parser.add_argument("--no-audio", action="store_true",
+                        help="音声を作らない（例文・クイズの再生ボタンが出ない）")
+    parser.add_argument("--voice", default=tts.DEFAULT_VOICE,
+                        help=f"ElevenLabsのボイス名（既定：{tts.DEFAULT_VOICE}）")
+    parser.add_argument("--voice-id", default="",
+                        help="ボイスをIDで直接指定する（名前で見つからないとき）")
+    parser.add_argument("--tts-model", default=tts.DEFAULT_MODEL,
+                        help=f"読み上げモデル（既定：{tts.DEFAULT_MODEL}）")
+    parser.add_argument("--tts-format", default=tts.DEFAULT_FORMAT,
+                        help=f"音声の形式（既定：{tts.DEFAULT_FORMAT}）")
+    parser.add_argument("--tts-text", choices=["kanji", "kana"], default="kanji",
+                        help="読ませる文を漢字のまま送るか、ふりがな通りのかなにするか"
+                             "（kanji=自然な抑揚・読みはモデル任せ／kana=読みは確実）")
+    parser.add_argument("--tts-workers", type=int, default=tts.DEFAULT_WORKERS,
+                        help=f"音声を同時に作る数（既定：{tts.DEFAULT_WORKERS}）")
+    parser.add_argument("--tts-cache", type=Path, default=tts.CACHE_DIR,
+                        help="作った音声のキャッシュ（既定：スキルフォルダの.tts_cache）")
+    parser.add_argument("--tts-language", default=tts.DEFAULT_LANGUAGE,
+                        help=f"読み上げる言語を明示する（既定：{tts.DEFAULT_LANGUAGE}）")
     parser.add_argument("--append", action="store_true",
                         help="同じ日付のcontent_<date>.jsonが既にあれば、上書きせずそこに合流させる"
                              "（同じ日の追加クラス用。ファイルがなければ通常通り新規作成）")
@@ -1857,10 +2038,25 @@ def main() -> int:
     if not args.skip_strokes:
         strokes, failed = load_strokes(content["kanji"], args.svg_cache)
 
+    # 例文とクイズの音声。ページを書く前に作る必要がある（再生ボタンはmp3が
+    # できた文にだけ付く）。キーは「表示上の文」＝speech_text()で、実際に読ませる
+    # 文は --tts-text 次第でそれと違うことがあるので、両者を対応づけておく。
+    audio, audio_note = {}, ""
+    if not args.no_audio:
+        say = speech_kana if args.tts_text == "kana" else speech_text
+        wanted: dict[str, str] = {}
+        for sentence in page_sentences(content):
+            wanted.setdefault(speech_text(sentence), say(sentence))
+        urls, audio_note = tts.speak_page(
+            list(wanted.values()), out, voice=args.voice, voice_id=args.voice_id,
+            model=args.tts_model, fmt=args.tts_format, workers=args.tts_workers,
+            cache_dir=args.tts_cache, language=args.tts_language)
+        audio = {key: urls[said] for key, said in wanted.items() if said in urls}
+
     out.parent.mkdir(parents=True, exist_ok=True)
     content_out.parent.mkdir(parents=True, exist_ok=True)
     content_out.write_text(json.dumps(content, ensure_ascii=False, indent=2), encoding="utf-8")
-    out.write_text(build(content, strokes, str(content_out), f"{args.kind}:{day}"),
+    out.write_text(build(content, strokes, str(content_out), f"{args.kind}:{day}", audio=audio),
                    encoding="utf-8")
 
     history = load_history(args.history)
@@ -1872,6 +2068,8 @@ def main() -> int:
 
     loaded = sum(1 for data in strokes.values() if data)
     print(f"完了：{out}（筆順 {loaded}/{len(content['kanji'])}字）")
+    if audio_note:
+        print(f"  {audio_note}")
     if graded:
         print(f"  クイズの成績 {graded} 問分を履歴に記録しました")
     if dupes:

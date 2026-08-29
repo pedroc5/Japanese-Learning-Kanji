@@ -5,6 +5,8 @@
       "Bash(python3 /Users/pedrocoutinho/.claude/skills/kanji-practice/build_page.py *)",
       "Bash(python3 /Users/pedrocoutinho/.claude/skills/kanji-practice/build_review.py *)",
       "Bash(python3 /Users/pedrocoutinho/.claude/skills/kanji-practice/test_build_page.py)",
+      "WebFetch(domain:elevenlabs.io)",
+      "Bash(python3 /Users/pedrocoutinho/.claude/skills/kanji-practice/tts.py *)",
       "Bash(conda run -n kanji python /Users/pedrocoutinho/.claude/skills/kanji-practice/build_page.py *)",
       "Bash(conda run -n kanji python /Users/pedrocoutinho/.claude/skills/kanji-practice/build_review.py *)",
       "Edit(/tmp/kanji_content.json)",
