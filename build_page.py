@@ -1327,6 +1327,10 @@ def rich(text: str) -> str:
     The word tables were plain text before the ふりがな toggle reached them, so
     anything without ruby markup is still escaped as ordinary text; a cell the
     model wrote with furigana is passed through as markup instead.
+
+    The same applies to the short prose fields — 意味, 書き順, クイズの解説 —
+    where the model sometimes adds furigana by analogy with the sentences
+    around them; escaping those would print the tags on the page.
     """
     text = str(text)
     return text if "<ruby>" in text else esc(text)
@@ -1446,7 +1450,7 @@ def kanji_section(i: int, kanji: dict, stroke_data: dict | None) -> str:
     parts = [
         f'<p><b>訓読み</b>：{esc(kanji.get("kun", "—"))}　／　'
         f'<b>音読み</b>：{esc(kanji.get("on", "—"))}</p>',
-        f'<p class="en">意味：{esc(kanji.get("meaning", ""))}</p>',
+        f'<p class="en">意味：{rich(kanji.get("meaning", ""))}</p>',
     ]
 
     # 書き方 line — only rendered if at least one of its pieces is present.
@@ -1456,7 +1460,7 @@ def kanji_section(i: int, kanji: dict, stroke_data: dict | None) -> str:
     if kanji.get("radical"):
         writing_bits.append(f'部首：{esc(kanji["radical"])}')
     if kanji.get("order_note"):
-        writing_bits.append(f'書き順：{esc(kanji["order_note"])}')
+        writing_bits.append(f'書き順：{rich(kanji["order_note"])}')
     if writing_bits:
         parts.append(f'<p class="en"><b>書き方</b>：{"　".join(writing_bits)}</p>')
 
@@ -1565,11 +1569,11 @@ def quiz_section(quiz: list[dict], chars: list[str],
             f'<span class="res" data-r="{i}"></span></div></li>')
         note = question.get("note", "")
         answer_items.append(
-            f'    <li>{esc(question["a"])}{("（" + esc(note) + "）") if note else ""}</li>')
+            f'    <li>{esc(question["a"])}{("（" + rich(note) + "）") if note else ""}</li>')
         answer_key.append('    {"ok": %s, "alt": %s, "exp": %s, "char": %s}' % (
             js_str([question["a"]]),
             js_str(question.get("alt", [])),
-            js_str(esc(note)),                       # innerHTML に入るのでHTMLエスケープしてから
+            js_str(rich(note)),                      # innerHTML に入るのでHTMLエスケープしてから
             js_str(chars[i] if i < len(chars) else ""),
         ))
     body = """<p class="en">下の欄に入力して、「答え合わせ」ボタンを押すと、正しいか正しくないかを説明します。</p>

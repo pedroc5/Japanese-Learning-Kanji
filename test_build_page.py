@@ -271,6 +271,40 @@ class WordFuriganaTest(unittest.TestCase):
         self.assertIn("a &lt; b", table)
 
 
+class ProseFuriganaTest(unittest.TestCase):
+    """意味・書き順・クイズの解説にも、モデルはときどき<ruby>を書いてくる。
+    エスケープするとタグが画面にそのまま出てしまうので、通す。"""
+
+    def section(self, **extra) -> str:
+        kanji = dict(sample_content()["kanji"][0], **extra)
+        return build_page.kanji_section(1, kanji, None)
+
+    def test_furigana_in_the_meaning_line_is_rendered(self):
+        section = self.section(meaning="かみなり ／ <ruby>雷<rt>かみなり</rt></ruby>")
+        self.assertIn("<ruby>雷<rt>かみなり</rt></ruby>", section)
+
+    def test_furigana_in_the_stroke_order_note_is_rendered(self):
+        section = self.section(order_note="<ruby>最後<rt>さいご</rt></ruby>のたて画。")
+        self.assertIn("書き順：<ruby>最後<rt>さいご</rt></ruby>のたて画。", section)
+
+    def test_plain_prose_is_still_escaped(self):
+        self.assertIn("a &lt; b", self.section(meaning="a < b"))
+        self.assertIn("a &lt; b", self.section(order_note="a < b"))
+
+    def test_furigana_in_a_quiz_note_reaches_both_the_list_and_the_key(self):
+        note = "<ruby>音<rt>おん</rt></ruby>読みです。"
+        section = build_page.quiz_section(
+            [{"q": "問題", "a": "らいう", "alt": [], "note": note}], ["雷"])
+        self.assertIn(f"（{note}）", section)          # 答えのリスト
+        self.assertEqual(quiz_key(section)[0]["exp"], note)            # JSの解説
+
+    def test_a_plain_quiz_note_is_still_escaped(self):
+        section = build_page.quiz_section(
+            [{"q": "問題", "a": "にじ", "alt": [], "note": "a < b"}], ["虹"])
+        self.assertNotIn("a < b", section)
+        self.assertIn("a &lt; b", section)
+
+
 class ExampleReuseTest(unittest.TestCase):
     """クイズは同じ単語の別の文で出す — 例文の使い回しは警告する。"""
 
