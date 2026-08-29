@@ -12,14 +12,31 @@
     <string>$HOME/.claude/skills/kanji-practice/run_daily.sh</string>
   </array>
 
-  <!-- 月〜金の9:00に実行（Weekday: 1=月 … 5=金） -->
+  <!-- 月〜金の9:00に実行（Weekday: 1=月 … 5=金）。
+       12:00と16:00は朝の取り返し用。2026-08-18、9:00の予約がMacの睡眠で流れ、
+       起こされた2秒のdark wakeの中でclaudeが死に、その日のページが作られな
+       かった（08-12も同じ、08-13・08-14もおそらく同じ）。launchdは逃した回を
+       次の目覚めに1度だけ回すので、それが今回のように短いdark wakeだと一日
+       まるごと落ちる。昼と夕方にもう2回起きれば、そのうち1回はPedroがMacを
+       開けている時間に当たる。既にその日のページがあるときは run_daily.sh が
+       何もせず終わるので、成功した日に二度書きすることはない。 -->
   <key>StartCalendarInterval</key>
   <array>
     <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>12</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>16</integer><key>Minute</key><integer>0</integer></dict>
     <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>12</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>16</integer><key>Minute</key><integer>0</integer></dict>
     <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>12</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>16</integer><key>Minute</key><integer>0</integer></dict>
     <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>12</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>16</integer><key>Minute</key><integer>0</integer></dict>
     <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>12</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>16</integer><key>Minute</key><integer>0</integer></dict>
   </array>
 
   <!-- Mac がスリープしていて時間を逃した場合、起きたときに実行する -->
