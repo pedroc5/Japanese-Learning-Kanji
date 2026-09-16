@@ -35,7 +35,9 @@ import xml.etree.ElementTree as ET
 from datetime import date, timedelta
 from pathlib import Path
 
+import sbv2
 import tts
+import voicevox
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_SVG_CACHE = HERE / ".kanjivg_cache"
@@ -382,6 +384,170 @@ STROKE_JS = """
 """
 
 
+GRADE_JS = """
+/* 書き取りの採点 — 書いた線をお手本の画に対応づけ、順番と向きを見る。
+
+   ここはDOMを一切触らない純粋な計算なので、ブラウザの外でも動く。
+   test_build_page.py が jsc（macOS同梱のJavaScriptCore）にこの文字列を
+   そのまま読ませて試しているので、ページに載るのと**同じコード**を試せている。
+
+   入出力はどちらも「0〜1のマス目座標」で、user も model も画ごとの点列
+   （[ [[x,y],[x,y],…], … ]）。model の並び順と各画の向きはKanjiVGが持っている
+   ものをそのまま使う（`-s1`,`-s2`… が筆順、各パスの d は書き始めから始まる）。
+
+   **なぜ画をindexで突き合わせないか。** 順番の間違いを見つけるのが目的だから。
+   1画目と2画目を入れ替えて書いた人をindexで採点すると、「1画目の向きが違う・
+   2画目の向きが違う」と的外れなことを2つ言うだけで、**入れ替えたこと自体は
+   言えない**。先に「書いた線がどの画なのか」を形で決め、それから並び順を見る。
+
+   **平行移動は見ない。** マスの左に寄せて書いても字は同じなので、両方を
+   重心に合わせてから比べる。画は全部同じ点数に取り直してあるので、この重心は
+   ゆっくり書いた画に引っぱられない（点の密度ではなく形で決まる）。
+*/
+var __kanjiGrade = (function(){
+  var N = 16;             // 1画を何点に取り直すか。形を比べるには点数が揃っている必要がある
+  var REV_RATIO = 0.5;    // 逆に見たほうが「倍は近い」なら、逆向きに書いている
+  var REV_FLOOR = 0.02;   // ただしこれだけは離れていてほしい（誤差で言い出さない）
+  var SHORT = 0.08;       // これより短い画は点。向きを問わない
+  var OFF = 0.16;         // 形・位置がずれていると言い出す平均距離
+  var MAX_NOTES = 3;      // 指摘しすぎない
+
+  /* 点列を、長さで等間隔なN点に取り直す。速く書いた画と遅く書いた画で
+     点の数が違っても、同じ形なら同じ列になる。 */
+  function resample(points, n){
+    var out = [], i;
+    if (!points || !points.length) return out;
+    if (points.length === 1){
+      for (i = 0; i < n; i++) out.push([points[0][0], points[0][1]]);
+      return out;
+    }
+    var at = [0], total = 0;
+    for (i = 1; i < points.length; i++){
+      total += Math.sqrt(Math.pow(points[i][0] - points[i-1][0], 2) +
+                         Math.pow(points[i][1] - points[i-1][1], 2));
+      at.push(total);
+    }
+    if (total === 0){
+      for (i = 0; i < n; i++) out.push([points[0][0], points[0][1]]);
+      return out;
+    }
+    var j = 1;
+    for (var k = 0; k < n; k++){
+      var want = total * k / (n - 1);
+      while (j < points.length - 1 && at[j] < want) j++;
+      var span = at[j] - at[j-1];
+      var t = span ? (want - at[j-1]) / span : 0;
+      out.push([points[j-1][0] + (points[j][0] - points[j-1][0]) * t,
+                points[j-1][1] + (points[j][1] - points[j-1][1]) * t]);
+    }
+    return out;
+  }
+
+  /* 全部の画をまとめて重心に寄せる = 平行移動を無かったことにする。 */
+  function center(strokes){
+    var sx = 0, sy = 0, n = 0;
+    strokes.forEach(function(s){
+      s.forEach(function(p){ sx += p[0]; sy += p[1]; n++; });
+    });
+    if (!n) return strokes;
+    var cx = sx / n, cy = sy / n;
+    return strokes.map(function(s){
+      return s.map(function(p){ return [p[0] - cx, p[1] - cy]; });
+    });
+  }
+
+  function meanDist(a, b){
+    var sum = 0;
+    for (var i = 0; i < a.length; i++)
+      sum += Math.sqrt(Math.pow(a[i][0] - b[i][0], 2) + Math.pow(a[i][1] - b[i][1], 2));
+    return sum / a.length;
+  }
+
+  function length(points){
+    var total = 0;
+    for (var i = 1; i < points.length; i++)
+      total += Math.sqrt(Math.pow(points[i][0] - points[i-1][0], 2) +
+                         Math.pow(points[i][1] - points[i-1][1], 2));
+    return total;
+  }
+
+  /* 書いた線とお手本の画の対応づけ。安いほうから順に取っていく貪欲法で、
+     画は多くても30本ほどなので総当たりで足りる。逆向きに書かれていても
+     同じ画だと分かるように、順・逆の近いほうを距離とする。 */
+  function assign(user, model){
+    var pairs = [];
+    for (var i = 0; i < user.length; i++){
+      var back = user[i].slice().reverse();
+      for (var j = 0; j < model.length; j++){
+        var fwd = meanDist(user[i], model[j]);
+        var rev = meanDist(back, model[j]);
+        pairs.push({u: i, m: j, fwd: fwd, rev: rev, cost: Math.min(fwd, rev)});
+      }
+    }
+    pairs.sort(function(a, b){ return a.cost - b.cost; });
+    var usedU = {}, usedM = {}, taken = [];
+    pairs.forEach(function(p){
+      if (usedU[p.u] || usedM[p.m]) return;
+      usedU[p.u] = usedM[p.m] = 1;
+      taken.push(p);
+    });
+    taken.sort(function(a, b){ return a.u - b.u; });   // 書いた順に並べ直す
+    return taken;
+  }
+
+  function grade(user, model){
+    if (!model || !model.length || !user || !user.length)
+      return {ok: false, notes: []};
+
+    var U = center(user.map(function(s){ return resample(s, N); }));
+    var M = center(model.map(function(s){ return resample(s, N); }));
+    var pairs = assign(U, M);
+    var notes = [];
+    var sameCount = user.length === model.length;
+
+    if (!sameCount)
+      notes.push(model.length + "画のところを" + user.length + "画で書いています");
+
+    // 順番：書いた順に並べたお手本の画番号が、増えていかなければ入れ替わっている。
+    var seq = pairs.map(function(p){ return p.m; }), top = -1;
+    for (var k = 0; k < seq.length; k++){
+      if (seq[k] < top){
+        notes.push((top + 1) + "画目のあとに" + (seq[k] + 1) + "画目を書いています");
+        break;
+      }
+      top = seq[k];
+    }
+
+    // 向き：形で対応が取れているので、順・逆どちらに近いかがそのまま答えになる。
+    // 点のように短い画は向きを問わない（どちらから打っても同じ）。
+    //
+    // 見方は**比**にする。固定値で切ると短い画を取りこぼし（喜の7画目＝長さ0.111）、
+    // 長さに比例させると折り返す画を取りこぼす（察の8画目は長さ0.394あるが
+    // 折り返すので、逆から書いても点はそれほど動かない）。比なら両方拾える。
+    pairs.forEach(function(p){
+      if (notes.length >= MAX_NOTES) return;
+      if (Math.min(length(U[p.u]), length(M[p.m])) < SHORT) return;
+      if (p.fwd - p.rev > REV_FLOOR && p.rev < p.fwd * REV_RATIO)
+        notes.push((p.m + 1) + "画目を逆向きに書いています");
+    });
+
+    // 形・位置。画数が合っていないときは重心が寄っておらず、当てにならないので黙る。
+    if (sameCount) pairs.forEach(function(p){
+      if (notes.length >= MAX_NOTES) return;
+      if (p.cost > OFF) notes.push((p.m + 1) + "画目の形がずれています");
+    });
+
+    return {ok: !notes.length, notes: notes.slice(0, MAX_NOTES)};
+  }
+
+  return grade;
+})();
+"""
+
+
+GRADE_SCRIPT = "<script>\n" + GRADE_JS.strip("\n") + "\n</script>\n"
+
+
 PRACTICE_JS = """
 <script>
 /* 書き取り練習：各字のマスに、押した点を線として記録して描く。
@@ -394,18 +560,27 @@ PRACTICE_JS = """
 */
 (function(){
   var SIZE = 112;
+  var SAMPLES = 16;                                  // GRADE_JS の N と揃える
   var store = window.__kanjiStore;
   var saved = store ? store.load("pads", {}) : {};
 
+  /* お手本の画を、マス目座標(0〜1)の点列として読み出す。
+
+     採点は形で画を見分けるので、始点と終点だけでは足りない（横画は全部
+     「左から右」で、端の2点では区別がつかない）。パスの上を等間隔に拾う。
+     .ink path はKanjiVGのパスをそのままの順で並べたものなので、この配列の
+     並びがそのまま筆順、各パスの向きがそのまま書く向きになっている。 */
   function modelStrokes(char){
     var svg = document.querySelector('.strokes[data-kanji="' + char + '"]');
     if (!svg) return null;
     var vb = svg.viewBox.baseVal;
     return Array.prototype.map.call(svg.querySelectorAll(".ink path"), function(p){
-      var len = p.getTotalLength();
-      var a = p.getPointAtLength(0), b = p.getPointAtLength(len);
-      return {ax: (a.x - vb.x) / vb.width, ay: (a.y - vb.y) / vb.height,
-              bx: (b.x - vb.x) / vb.width, by: (b.y - vb.y) / vb.height};
+      var len = p.getTotalLength(), pts = [];
+      for (var i = 0; i < SAMPLES; i++){
+        var pt = p.getPointAtLength(len * i / (SAMPLES - 1));
+        pts.push([(pt.x - vb.x) / vb.width, (pt.y - vb.y) / vb.height]);
+      }
+      return pts;
     });
   }
 
@@ -421,29 +596,17 @@ PRACTICE_JS = """
     });
   }
 
+  /* 採点そのものは __kanjiGrade（GRADE_JS）にある。ここはマスのピクセル座標を
+     0〜1に直して渡し、返ってきた指摘を書き出すだけ。 */
   function grade(entry, model){
     var user = entry.strokes;
     if (!model || !model.length || !user.length) return {cls: "", text: ""};
-
-    var notes = [];
-    if (user.length !== model.length) {
-      notes.push(model.length + "画のところを" + user.length + "画で書いています");
-    }
-    var n = Math.min(user.length, model.length);
-    for (var i = 0; i < n; i++) {
-      var s = user[i], a = s[0], b = s[s.length - 1];
-      var ux = (b[0] - a[0]) / SIZE, uy = (b[1] - a[1]) / SIZE;
-      var mx = model[i].bx - model[i].ax, my = model[i].by - model[i].ay;
-      var lu = Math.sqrt(ux * ux + uy * uy), lm = Math.sqrt(mx * mx + my * my);
-      if (lu < 0.04 || lm < 0.04) continue;        // 点のような画は向きを判定しない
-      var cos = (ux * mx + uy * my) / (lu * lm);
-      var dx = a[0] / SIZE - model[i].ax, dy = a[1] / SIZE - model[i].ay;
-      if (cos < 0.3) notes.push((i + 1) + "画目の向きが違うようです");
-      else if (Math.sqrt(dx * dx + dy * dy) > 0.28) notes.push((i + 1) + "画目の書き始めの位置");
-      if (notes.length >= 3) break;                // 指摘しすぎない
-    }
-    return notes.length ? {cls: "ng", text: "△ " + notes.join("／") + "。"}
-                        : {cls: "ok", text: "〇 画数も向きも合っています。"};
+    var scaled = user.map(function(stroke){
+      return stroke.map(function(pt){ return [pt[0] / SIZE, pt[1] / SIZE]; });
+    });
+    var verdict = window.__kanjiGrade(scaled, model);
+    return verdict.ok ? {cls: "ok", text: "〇 画数・順番・向き、すべて合っています。"}
+                      : {cls: "ng", text: "△ " + verdict.notes.join("／") + "。"};
   }
 
   document.querySelectorAll(".practice-block").forEach(function(block){
@@ -955,7 +1118,7 @@ def record_quiz_results(history: dict, results: list[dict], day: str) -> int:
     attempted questions count: 未回答 says nothing about whether the reading is
     known, and counting it as a miss would push every skipped question to the
     front of the review. 惜しい counts as a miss — a near-hit is still a reading
-    Pedro hasn't got yet.
+    the learner hasn't got yet.
 
     Kanji with no history entry (a character that never appeared in a daily
     page) are skipped rather than invented, so the file stays a record of what
@@ -1201,7 +1364,7 @@ def collapsible(heading: str, body: str) -> str:
 
 def chatbox_html() -> str:
     """A general-purpose chat sidebar: no kanji/page context is injected —
-    Pedro can ask about anything, not just today's practice. The local
+    the learner can ask about anything, not just today's practice. The local
     ask_server answers in a Japanese-teacher voice (see ASK_SYSTEM_PROMPT
     there) and keeps each browser tab's messages as one ongoing conversation
     (via `claude -p --resume`), so this renders a running transcript rather
@@ -1270,7 +1433,8 @@ def intro_box_html(theme: str, count: int, chars: str, note: str = "",
     stroke_help = [
         '  <p class="en">※筆順アニメーションは KanjiVG（CC BY-SA 3.0）のデータから作成しています。'
         "赤ではなく画ごとに色が変わり、数字が何画目かを示します。</p>",
-        '  <p class="en">※各字の書き取り練習では「書き順を確認する」で、画数と各画の向きを見てもらえます。'
+        '  <p class="en">※各字の書き取り練習では「書き順を確認する」で、画数・書いた順番・'
+        "各画の向きを見てもらえます（マスの中で寄せて書いても、位置は採点しません）。"
         "書き順の基本：①上から下へ　②左から右へ　③横画→縦画　④外側の囲み→中身→ふたは最後。</p>",
     ]
     # 何を読む順に案内するかはページの種類（今日／今週）で決まる。筆順の有無で
@@ -1623,6 +1787,29 @@ def speech_kana(text: str) -> str:
     return speech_text(text)
 
 
+def reading_checks(text: str) -> list[tuple[str, str]]:
+    """The (書き方, ふりがな) pairs a clip of this sentence has to come back with.
+
+    Every <ruby> on the page is a reading step 4 verified on jisho, so the page
+    already knows what the voice is supposed to say — this just hands that
+    knowledge to the part of the build that can hear. Pairs with an empty <rt>
+    (カタカナ語 written that way in the content JSON) carry no reading to check
+    and are left out.
+
+    The same two things speech_text() drops are dropped here: a folded hint is
+    not read aloud, so it has nothing to be checked against.
+    """
+    text = re.sub(r"<details.*?</details>", "", str(text), flags=re.S)
+    text = re.sub(r"<(\w+)[^>]*\bdata-nospeak\b[^>]*>.*?</\1>", "", text, flags=re.S)
+    pairs = []
+    for match in re.finditer(r"<ruby>(.*?)<rt>(.*?)</rt></ruby>", text, re.S):
+        base = html.unescape(re.sub(r"<[^>]+>", "", match.group(1))).strip()
+        reading = html.unescape(re.sub(r"<[^>]+>", "", match.group(2))).strip()
+        if base and reading:
+            pairs.append((base, reading))
+    return pairs
+
+
 def audio_button(text: str, audio: dict[str, dict] | None) -> str:
     """The play button for one sentence, or "" when it has no clip.
 
@@ -1633,8 +1820,8 @@ def audio_button(text: str, audio: dict[str, dict] | None) -> str:
 
     The voice's name sits in front of the button, in italics and brackets.
     Four voices take turns through a page, and a name only visible on hover is
-    a name Pedro can't use — he'd hear that two clips differ without being able
-    to say which reader he preferred. It is fixed-width and right-aligned so
+    a name the listener can't use — they'd hear that two clips differ without
+    being able to say which reader they preferred. It is fixed-width and right-aligned so
     the ▶ buttons still line up in a column whether the reader is Riku or
     Shizuka.
     """
@@ -1662,7 +1849,7 @@ def reused_examples(content: dict) -> list[str]:
     """Quiz questions that are just one of the day's example sentences again.
 
     The quiz is meant to test the reading in a *new* sentence — a question
-    copied from the 例文 a few lines above only tests whether Pedro remembers
+    copied from the 例文 a few lines above only tests whether the learner remembers
     the page. Substrings count too, since trimming an example down to its first
     clause is the same sentence for this purpose.
 
@@ -1698,7 +1885,7 @@ def quiz_section(quiz: list[dict], chars: list[str],
 
     `audio` maps a question sentence to its mp3, adding a play button in front
     of it. Note that hearing the question read aloud gives away the reading it
-    is asking for; that is deliberate — Pedro asked for the exercises to be
+    is asking for; that is deliberate — the exercises are meant to be
     playable — but it means the button is a hint, not just an aid.
 
     `heading` names the section — the weekly page's list is not only readings,
@@ -1819,7 +2006,7 @@ def level_summary(kanji: list[dict]) -> str:
 def build(content: dict, strokes: dict[str, dict | None], content_file: str = "",
           page_id: str = "", sections: list[str] | None = None,
           heading: str = "漢字練習", period: str = "今日",
-          audio: dict[str, str] | None = None) -> str:
+          audio: dict[str, str] | None = None, audio_credit: str = "") -> str:
     """Assemble the whole self-contained practice page and return it as HTML.
 
     `strokes` maps character -> KanjiVG stroke data (or None when it couldn't
@@ -1861,6 +2048,10 @@ def build(content: dict, strokes: dict[str, dict | None], content_file: str = ""
     # KanjiVG is credited where its data is actually embedded, so the review
     # page — which draws no strokes — doesn't claim to use it.
     credit = " ／ 筆順データ：KanjiVG (CC BY-SA 3.0)" if any(strokes.values()) else ""
+    # VOICEVOXの利用規約はクレジット表記を求めている。音がページに載っている
+    # ときだけ、実際に聞こえる話者の名前で出す。
+    if audio_credit:
+        credit += f" ／ {audio_credit}"
     wrap = "\n".join([
         f"<h1>{esc(heading)}</h1>",
         f'<p class="sub">{day}　テーマ：<b>{esc(theme)}</b>　'
@@ -1914,6 +2105,7 @@ def build(content: dict, strokes: dict[str, dict | None], content_file: str = ""
         "",
         banner("スクリプト"),
         STROKE_JS,
+        GRADE_SCRIPT,
         PRACTICE_JS,
         CHAT_JS,
         CHAT_RESIZE_JS,
@@ -1978,6 +2170,59 @@ def merge_content(previous: dict, addition: dict) -> dict:
     return previous
 
 
+def speak(args, texts: list[str], out: Path,
+          checks: dict[str, list[tuple[str, str]]],
+          readings: dict[str, str] | None = None) -> tuple[dict, str, str]:
+    """The day's audio, from whichever engine is asked for.
+
+    VOICEVOX is the default since 2026-08-31: it settles the reading before it
+    makes a sound, it is free, and it runs on this machine. ElevenLabs is kept
+    whole behind --tts-engine elevenlabs, and is also where VOICEVOX falls back
+    to when its engine cannot be started — a morning where the engine is missing
+    should cost the page nothing.
+    """
+    def elevenlabs():
+        return tts.speak_page(
+            texts, out, voice=args.voice, voice_id=args.voice_id,
+            model=args.tts_model, fmt=args.tts_format, workers=args.tts_workers,
+            cache_dir=args.tts_cache, language=args.tts_language,
+            checks=checks, attempts=args.tts_attempts, stt_model=args.tts_stt_model)
+
+    if args.tts_engine == "elevenlabs":
+        urls, note = elevenlabs()
+        return urls, note, ""
+
+    if args.tts_engine == "sbv2":
+        # ふりがなをそのまま読ませる。sbv2の読みはVOICEVOXと同じOpenJTalkなので、
+        # 渡さなければ同じ誤読（猿人→サルジン、はち→ワチ）をそのまま踏む。
+        urls, note = sbv2.speak_page(
+            texts, out, voice=args.sbv2_voice, cache_dir=args.sbv2_cache,
+            readings=readings, overrides=tts.load_overrides(args.tts_cache),
+            device=args.sbv2_device)
+        if urls:
+            return urls, note, sbv2.credit(urls)
+        if not args.tts_fallback:
+            return urls, note, ""
+        print(f"  {note} → VOICEVOXに切り替えます", file=sys.stderr)
+        spare, spare_note = voicevox.speak_page(
+            texts, out, voice=args.vv_voice, cache_dir=args.vv_cache,
+            workers=args.vv_workers, fmt=args.vv_format, checks=checks,
+            overrides=tts.load_overrides(args.tts_cache))
+        return spare, f"{spare_note}（sbv2が使えずVOICEVOXで作りました）", voicevox.credit(spare)
+
+    urls, note = voicevox.speak_page(
+        texts, out, voice=args.vv_voice, cache_dir=args.vv_cache,
+        workers=args.vv_workers, fmt=args.vv_format, checks=checks,
+        overrides=tts.load_overrides(args.tts_cache))
+    if urls:
+        return urls, note, voicevox.credit(urls)
+    if not args.tts_fallback:
+        return urls, note, ""
+    print(f"  {note} → ElevenLabsに切り替えます", file=sys.stderr)
+    spare, spare_note = elevenlabs()
+    return spare, f"{spare_note}（VOICEVOXが使えずElevenLabsで作りました）", ""
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="漢字練習HTMLを組み立てる")
     parser.add_argument("content", type=Path, help="内容を書いたJSONファイル")
@@ -1997,6 +2242,24 @@ def main() -> int:
                         help="コンテンツJSONの保存先（既定：out横のcontent_<date>.json）")
     parser.add_argument("--no-audio", action="store_true",
                         help="音声を作らない（例文・クイズの再生ボタンが出ない）")
+    parser.add_argument("--tts-engine", choices=["voicevox", "sbv2", "elevenlabs"],
+                        default="voicevox",
+                        help="読み上げエンジン（既定：voicevox。sbv2=Style-BERT-VITS2 JP-Extra、"
+                             "elevenlabsは以前の課金版）")
+    parser.add_argument("--sbv2-voice", default=sbv2.DEFAULT_VOICE,
+                        help=f"Style-BERT-VITS2の話者（既定：{sbv2.DEFAULT_VOICE}）")
+    parser.add_argument("--sbv2-cache", type=Path, default=sbv2.CACHE_DIR)
+    parser.add_argument("--sbv2-device", default=sbv2.DEFAULT_DEVICE,
+                        choices=["cpu", "mps"],
+                        help="cpuのほうが速い（M3実測 2.0s/文 対 mps 6.0s/文）")
+    parser.add_argument("--vv-voice", default=voicevox.DEFAULT_VOICE,
+                        help=f"VOICEVOXの話者（既定：{voicevox.DEFAULT_VOICE}）")
+    parser.add_argument("--vv-format", default=voicevox.DEFAULT_FORMAT,
+                        choices=["m4a", "wav"], help="VOICEVOXの音声形式（既定：m4a）")
+    parser.add_argument("--vv-workers", type=int, default=voicevox.DEFAULT_WORKERS)
+    parser.add_argument("--vv-cache", type=Path, default=voicevox.CACHE_DIR)
+    parser.add_argument("--no-tts-fallback", dest="tts_fallback", action="store_false",
+                        help="VOICEVOXが使えないときElevenLabsに切り替えない")
     parser.add_argument("--voice", default=tts.DEFAULT_VOICE,
                         help=f"ElevenLabsのボイス名（既定：{tts.DEFAULT_VOICE}）")
     parser.add_argument("--voice-id", default="",
@@ -2008,6 +2271,13 @@ def main() -> int:
     parser.add_argument("--tts-text", choices=["kanji", "kana"], default="kanji",
                         help="読ませる文を漢字のまま送るか、ふりがな通りのかなにするか"
                              "（kanji=自然な抑揚・読みはモデル任せ／kana=読みは確実）")
+    parser.add_argument("--tts-attempts", type=int, default=tts.DEFAULT_ATTEMPTS,
+                        help="1文の読み上げを最大何回まで録り直すか。読み上げたものを"
+                             "聞き取り直してページのふりがなと突き合わせ、違っていたら"
+                             "引き直す（1にすると確認そのものをしない）"
+                             f"（既定：{tts.DEFAULT_ATTEMPTS}）")
+    parser.add_argument("--tts-stt-model", default=tts.DEFAULT_STT_MODEL,
+                        help=f"読みの確認に使う聞き取りモデル（既定：{tts.DEFAULT_STT_MODEL}）")
     parser.add_argument("--tts-workers", type=int, default=tts.DEFAULT_WORKERS,
                         help=f"音声を同時に作る数（既定：{tts.DEFAULT_WORKERS}）")
     parser.add_argument("--tts-cache", type=Path, default=tts.CACHE_DIR,
@@ -2041,23 +2311,26 @@ def main() -> int:
     # 例文とクイズの音声。ページを書く前に作る必要がある（再生ボタンはmp3が
     # できた文にだけ付く）。キーは「表示上の文」＝speech_text()で、実際に読ませる
     # 文は --tts-text 次第でそれと違うことがあるので、両者を対応づけておく。
-    audio, audio_note = {}, ""
+    audio, audio_note, audio_credit = {}, "", ""
     if not args.no_audio:
         say = speech_kana if args.tts_text == "kana" else speech_text
         wanted: dict[str, str] = {}
+        checks: dict[str, list[tuple[str, str]]] = {}
+        readings: dict[str, str] = {}
         for sentence in page_sentences(content):
-            wanted.setdefault(speech_text(sentence), say(sentence))
-        urls, audio_note = tts.speak_page(
-            list(wanted.values()), out, voice=args.voice, voice_id=args.voice_id,
-            model=args.tts_model, fmt=args.tts_format, workers=args.tts_workers,
-            cache_dir=args.tts_cache, language=args.tts_language)
+            said = say(sentence)
+            wanted.setdefault(speech_text(sentence), said)
+            checks.setdefault(said, reading_checks(sentence))
+            readings.setdefault(said, speech_kana(sentence))
+        urls, audio_note, audio_credit = speak(args, list(wanted.values()), out,
+                                               checks, readings)
         audio = {key: urls[said] for key, said in wanted.items() if said in urls}
 
     out.parent.mkdir(parents=True, exist_ok=True)
     content_out.parent.mkdir(parents=True, exist_ok=True)
     content_out.write_text(json.dumps(content, ensure_ascii=False, indent=2), encoding="utf-8")
-    out.write_text(build(content, strokes, str(content_out), f"{args.kind}:{day}", audio=audio),
-                   encoding="utf-8")
+    out.write_text(build(content, strokes, str(content_out), f"{args.kind}:{day}",
+                         audio=audio, audio_credit=audio_credit), encoding="utf-8")
 
     history = load_history(args.history)
     dupes = update_history(history, content, args.kind, day, str(content_out))

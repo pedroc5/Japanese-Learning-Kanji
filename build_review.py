@@ -31,7 +31,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import build_page  # noqa: E402
-import tts  # noqa: E402
+import sbv2
+import tts
+import voicevox  # noqa: E402
 from build_page import banner, esc, rich, word_ruby  # noqa: E402
 
 # 一覧表に読み付きで載せる語の数。ここに出した語は練習問題では避ける（答えが
@@ -173,7 +175,7 @@ def shown_words(kanji: list[dict], words: int = SHOWN_WORDS) -> set[str]:
 
     A word is off-limits for the exercises wherever it appears in the table,
     not only in its own kanji's row: 感涙 sits in both 感's row and 涙's, so
-    asking Pedro to write it would still be a copying exercise.
+    asking the learner to write it would still be a copying exercise.
     """
     return {word["w"] for entry in kanji for word in entry.get("words", [])[:words]
             if word.get("w")}
@@ -186,7 +188,7 @@ def pick_words(entry: dict, shown: set[str]) -> tuple[list[dict], dict | None]:
     different words, and — where the word list is long enough — none of them
     among the `shown` ones the summary table prints with furigana. A quiz whose
     answers are all sitting in the table above it is a reading exercise for the
-    table, not for Pedro.
+    table, not for the learner.
 
     Words written the same way but read differently (怒る as おこる and いかる)
     are dropped: shown on their own, they have no single right answer. They
@@ -238,7 +240,7 @@ def writing_question(entry: dict, word: dict) -> dict:
     """書き: the reading and the meaning, write it in kanji.
 
     Which kanji it uses is the hint, and it stays folded away — given the
-    character, most of these answer themselves. Pedro opens it when he's stuck,
+    character, most of these answer themselves. The learner opens it when stuck,
     which is also the honest signal that the character needs another look.
     """
     gloss = gloss_of(word)
@@ -261,7 +263,7 @@ def exercises(kanji: list[dict], shown: int = SHOWN_WORDS, writing: bool = True)
 
     Written here rather than collected from the daily pages on purpose. Those
     questions have already been answered once this week, so re-asking them
-    tests what Pedro remembers of Tuesday's page as much as it tests the kanji;
+    tests what the learner remembers of Tuesday's page as much as it tests the kanji;
     these are built from the same word tables but ask about different words,
     and the 書き direction (produce the kanji) is one the daily pages never ask
     for at all.
@@ -298,6 +300,19 @@ def main() -> int:
     parser.add_argument("--tts-model", default=tts.DEFAULT_MODEL)
     parser.add_argument("--tts-format", default=tts.DEFAULT_FORMAT)
     parser.add_argument("--tts-text", choices=["kanji", "kana"], default="kanji")
+    parser.add_argument("--tts-attempts", type=int, default=tts.DEFAULT_ATTEMPTS)
+    parser.add_argument("--tts-stt-model", default=tts.DEFAULT_STT_MODEL)
+    parser.add_argument("--tts-engine", choices=["voicevox", "sbv2", "elevenlabs"],
+                        default="voicevox")
+    parser.add_argument("--sbv2-voice", default=sbv2.DEFAULT_VOICE)
+    parser.add_argument("--sbv2-cache", type=Path, default=sbv2.CACHE_DIR)
+    parser.add_argument("--sbv2-device", default=sbv2.DEFAULT_DEVICE, choices=["cpu", "mps"])
+    parser.add_argument("--vv-voice", default=voicevox.DEFAULT_VOICE)
+    parser.add_argument("--vv-format", default=voicevox.DEFAULT_FORMAT,
+                        choices=["m4a", "wav"])
+    parser.add_argument("--vv-workers", type=int, default=voicevox.DEFAULT_WORKERS)
+    parser.add_argument("--vv-cache", type=Path, default=voicevox.CACHE_DIR)
+    parser.add_argument("--no-tts-fallback", dest="tts_fallback", action="store_false")
     parser.add_argument("--tts-workers", type=int, default=tts.DEFAULT_WORKERS)
     parser.add_argument("--tts-cache", type=Path, default=tts.CACHE_DIR)
     parser.add_argument("--tts-language", default=tts.DEFAULT_LANGUAGE)
@@ -317,7 +332,7 @@ def main() -> int:
     # before it's used for ordering, or this week's own results are invisible.
     graded = build_page.ingest_quiz_results(history)
 
-    # Hardest first: the point of the weekly page is the kanji Pedro actually
+    # Hardest first: the point of the weekly page is the kanji the learner actually
     # missed, not another pass in the order they happened to be taught.
     merged_kanji.sort(key=lambda entry: build_page.quiz_priority(history, entry["char"]))
 
@@ -342,16 +357,19 @@ def main() -> int:
     # 節を組み立てる前にページのパスを確定させる（日々のページと同じ週フォルダ）。
     out = args.out or (args.root / build_page.week_folder(args.date)
                        / f"復習_{args.date}.html")
-    audio, audio_note = {}, ""
+    audio, audio_note, audio_credit = {}, "", ""
     if not args.no_audio:
         say = build_page.speech_kana if args.tts_text == "kana" else build_page.speech_text
         wanted: dict[str, str] = {}
+        checks: dict[str, list[tuple[str, str]]] = {}
+        readings: dict[str, str] = {}
         for question in quiz:
-            wanted.setdefault(build_page.speech_text(question["q"]), say(question["q"]))
-        urls, audio_note = tts.speak_page(
-            list(wanted.values()), out, voice=args.voice, voice_id=args.voice_id,
-            model=args.tts_model, fmt=args.tts_format, workers=args.tts_workers,
-            cache_dir=args.tts_cache, language=args.tts_language)
+            said = say(question["q"])
+            wanted.setdefault(build_page.speech_text(question["q"]), said)
+            checks.setdefault(said, build_page.reading_checks(question["q"]))
+            readings.setdefault(said, build_page.speech_kana(question["q"]))
+        urls, audio_note, audio_credit = build_page.speak(
+            args, list(wanted.values()), out, checks, readings)
         audio = {key: urls[said] for key, said in wanted.items() if said in urls}
 
     sections = [
@@ -377,7 +395,7 @@ def main() -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(build_page.build(merged_content, {}, page_id=f"review:{args.date}",
                                     sections=sections, heading="漢字の復習", period="今週",
-                                    audio=audio),
+                                    audio=audio, audio_credit=audio_credit),
                    encoding="utf-8")
 
     build_page.update_history(history, merged_content, "review", args.date, str(out))

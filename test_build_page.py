@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 import sys
+import tempfile
 import unittest
 import urllib.parse
 from html.parser import HTMLParser
@@ -25,6 +27,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import build_page  # noqa: E402
+import voicevox  # noqa: E402
 import build_review  # noqa: E402
 import tts  # noqa: E402
 
@@ -586,7 +589,7 @@ class SummaryTargetTest(unittest.TestCase):
 
 class SpeechTextTest(unittest.TestCase):
     """What actually gets read aloud. Getting this wrong is expensive twice
-    over: a bad clip is wrong in Pedro's ear and already paid for."""
+    over: a bad clip is wrong in the listener's ear and already paid for."""
 
     def test_furigana_is_not_read_a_second_time(self):
         spoken = build_page.speech_text(
@@ -663,7 +666,7 @@ class AudioButtonTest(unittest.TestCase):
 
     def test_the_voice_name_is_shown_beside_the_button(self):
         """Four voices take turns through the page. The name is on the page, in
-        front of the ▶ — not only in a tooltip, which Pedro can't read off."""
+        front of the ▶ — not only in a tooltip, which can't be read off."""
         section = build_page.kanji_section(1, self.content["kanji"][0],
                                            SAMPLE_STROKES, self.audio)
         self.assertIn('<i class="voice">(Sakura)</i><button', section)
@@ -860,6 +863,471 @@ class TTSCacheTest(unittest.TestCase):
                         if original is None else os.environ.__setitem__(tts.KEY_ENV, original))
         self.assertEqual(tts.load_key(key_file), "from-file")
         self.assertEqual(tts.load_key(self.dir / "missing"), "from-env")
+
+
+class ReadingCheckTest(unittest.TestCase):
+    """The page's furigana is the standard the audio is held to, so what gets
+    pulled out of it — and what counts as a mismatch — has to be exact."""
+
+    def test_the_checks_come_from_the_ruby(self):
+        checks = build_page.reading_checks(
+            "<b><ruby>祖父<rt>そふ</rt></ruby></b>は<ruby>類人猿<rt>るいじんえん</rt></ruby>だ。")
+        self.assertEqual(checks, [("祖父", "そふ"), ("類人猿", "るいじんえん")])
+
+    def test_a_hidden_hint_is_not_checked(self):
+        """speech_text() never reads a folded hint aloud, so there is nothing
+        of it in the clip to check against."""
+        checks = build_page.reading_checks(
+            "<ruby>山<rt>やま</rt></ruby>に<details><ruby>泊<rt>と</rt></ruby>まる</details>")
+        self.assertEqual(checks, [("山", "やま")])
+
+    def test_katakana_ruby_with_no_reading_is_skipped(self):
+        self.assertEqual(build_page.reading_checks("<ruby>バス<rt></rt></ruby>"), [])
+
+    def test_a_misread_word_is_caught(self):
+        """実際に出たもの：祖父が「ザフト」、鶏が「鳥」と読まれた。"""
+        self.assertEqual(
+            tts.reading_misses([("祖父", "そふ"), ("類人猿", "るいじんえん")],
+                               "ザフトは類人猿の研究で有名な学者が"),
+            ["祖父"])
+        self.assertEqual(tts.reading_misses([("鶏", "にわとり")], "庭に鳥が三羽いる"), ["鶏"])
+
+    def test_the_same_reading_in_another_spelling_is_not_a_miss(self):
+        """Scribeは書き方を選び直す。読みが同じなら音は正しい。"""
+        # 漢字がかなで返ってくる：分かる -> わかる、付いた -> ついた
+        self.assertEqual(tts.reading_misses([("分", "わ")], "何の鳥かわかる"), [])
+        self.assertEqual(tts.reading_misses([("付", "つ")], "名前がついた"), [])
+        # 数字：十年 -> 10年
+        self.assertEqual(tts.reading_misses([("十年", "じゅうねん")], "10年ぶりに古巣に戻る"), [])
+        # 句読点のちがいだけ
+        self.assertEqual(tts.reading_misses([("森", "もり")], "森の中で、鳥が鳴いている。"), [])
+
+    def test_kana_in_the_page_is_never_checked(self):
+        """かなは読み違えようがない。Scribeがそれを漢字で書いてきても
+        （そうじ -> 掃除）、音声の問題ではない。"""
+        self.assertEqual(tts.reading_misses(build_page.reading_checks(
+            "<ruby>扇風機<rt>せんぷうき</rt></ruby>の<ruby>羽根<rt>はね</rt></ruby>をそうじした。"),
+            "扇風機の羽根を掃除した"), [])
+
+
+class ReadingRetryTest(unittest.TestCase):
+    """A bad take is drawn again rather than kept: v3 does not read the same
+    sentence the same way twice, which is the whole reason a re-roll works."""
+
+    def setUp(self) -> None:
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        self.checks = [("祖父", "そふ")]
+
+    def patch(self, heard: list[str]):
+        """Each take comes back as the next transcript in `heard`."""
+        said, spoken = list(heard), []
+        def fake(path, key, **kwargs):
+            if path.startswith("/v1/text-to-speech"):
+                spoken.append(kwargs.get("body", {}).get("text", ""))
+                return b"ID3" + str(len(spoken)).encode()
+            return json.dumps({"text": said.pop(0)}).encode("utf-8")
+        original, tts._request = tts._request, fake
+        self.addCleanup(lambda: setattr(tts, "_request", original))
+        return spoken
+
+    def test_a_clean_take_is_kept_without_a_second_try(self):
+        spoken = self.patch(["祖父は学者だ"])
+        audio = tts.synthesize("祖父は学者だ。", "V1", "key", cache_dir=self.dir,
+                               checks=self.checks, attempts=3)
+        self.assertEqual(audio, b"ID31")
+        self.assertEqual(len(spoken), 1)
+
+    def test_a_misread_take_is_thrown_away_and_drawn_again(self):
+        spoken = self.patch(["ザフトは学者だ", "祖父は学者だ"])
+        audio = tts.synthesize("祖父は学者だ。", "V1", "key", cache_dir=self.dir,
+                               checks=self.checks, attempts=3)
+        self.assertEqual(len(spoken), 2)
+        self.assertEqual(audio, b"ID32")           # 二回目が採られる
+        name = tts.cache_key("祖父は学者だ。", "V1", tts.DEFAULT_MODEL, tts.DEFAULT_FORMAT)
+        self.assertEqual((self.dir / f"{name}.mp3").read_bytes(), b"ID32")
+        self.assertEqual(json.loads(tts.heard_path(self.dir, name)
+                                    .read_text(encoding="utf-8"))["missed"], [])
+
+    def test_the_attempts_run_out_and_the_best_take_is_kept(self):
+        """直らない文のために毎朝引き続けない。一番よい回を採って記録に残す。"""
+        spoken = self.patch(["ザフトは学者だ", "ザフトは学者だ", "ザフトは学者だ"])
+        tts.synthesize("祖父は学者だ。", "V1", "key", cache_dir=self.dir,
+                       checks=self.checks, attempts=3)
+        self.assertEqual(len(spoken), 3)
+        name = tts.cache_key("祖父は学者だ。", "V1", tts.DEFAULT_MODEL, tts.DEFAULT_FORMAT)
+        self.assertEqual(json.loads(tts.heard_path(self.dir, name)
+                                    .read_text(encoding="utf-8"))["missed"], ["祖父"])
+
+    def test_a_judged_clip_is_never_listened_to_twice(self):
+        name = tts.cache_key("祖父は学者だ。", "V1", tts.DEFAULT_MODEL, tts.DEFAULT_FORMAT)
+        (self.dir / f"{name}.mp3").write_bytes(b"ID3old")
+        tts.heard_path(self.dir, name).write_text(
+            json.dumps({"missed": ["祖父"]}), encoding="utf-8")
+        def explode(*args, **kwargs):
+            raise AssertionError("判定済みのクリップをまた聞きに行った")
+        original, tts._request = tts._request, explode
+        self.addCleanup(lambda: setattr(tts, "_request", original))
+        clips, failed = tts.synthesize_all({"祖父は学者だ。": "V1"}, "key",
+                                           cache_dir=self.dir, workers=1,
+                                           checks={"祖父は学者だ。": self.checks}, attempts=3)
+        self.assertEqual(clips, {"祖父は学者だ。": b"ID3old"})
+
+    def test_an_unjudged_cached_clip_is_listened_to_before_being_redone(self):
+        """確認より前に作ったクリップにも検査は届く。ただし正しければ
+        録り直さない — 聞くだけならクレジットを使わない。"""
+        name = tts.cache_key("祖父は学者だ。", "V1", tts.DEFAULT_MODEL, tts.DEFAULT_FORMAT)
+        (self.dir / f"{name}.mp3").write_bytes(b"ID3old")
+        spoken = self.patch(["祖父は学者だ"])
+        clips, failed = tts.synthesize_all({"祖父は学者だ。": "V1"}, "key",
+                                           cache_dir=self.dir, workers=1,
+                                           checks={"祖父は学者だ。": self.checks}, attempts=3)
+        self.assertEqual(clips, {"祖父は学者だ。": b"ID3old"})
+        self.assertEqual(spoken, [])               # 読み上げ直していない
+        self.assertTrue(tts.heard_path(self.dir, name).exists())
+
+    def test_one_attempt_means_no_checking_at_all(self):
+        def fake(path, key, **kwargs):
+            if path.startswith("/v1/speech-to-text"):
+                raise AssertionError("attempts=1 なのに聞き取りを呼んだ")
+            return b"ID3"
+        original, tts._request = tts._request, fake
+        self.addCleanup(lambda: setattr(tts, "_request", original))
+        tts.synthesize("文。", "V1", "key", cache_dir=self.dir,
+                       checks=self.checks, attempts=1)
+
+    def test_a_lost_transcript_costs_the_check_not_the_clip(self):
+        def fake(path, key, **kwargs):
+            if path.startswith("/v1/speech-to-text"):
+                raise tts.TTSError("HTTP 500")
+            return b"ID3"
+        original, tts._request = tts._request, fake
+        self.addCleanup(lambda: setattr(tts, "_request", original))
+        self.assertEqual(tts.synthesize("文。", "V1", "key", cache_dir=self.dir,
+                                        checks=self.checks, attempts=3), b"ID3")
+
+
+class VoiceChoiceTest(unittest.TestCase):
+    """読み違いが直らないときは声を替える。同じ声を引き直しても揺れる幅は
+    変わらないが、声を替えれば変わる（2026-08-31：Kozyの鶏卵、Shizukaの文頭の「つ」）。"""
+
+    def setUp(self) -> None:
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        self.keyfile = self.dir / "key"
+        self.keyfile.write_text("k", encoding="utf-8")
+        self.voices = [("Riku", tts.KNOWN_VOICES["riku"]),
+                       ("Sakura", tts.KNOWN_VOICES["sakura"])]
+
+    def test_the_sentence_is_sent_as_written(self):
+        """文の前に読点を置いてみたが、声がもう一度構え直して「くくえ」になった。
+        送るのは文そのもの。"""
+        sent = {}
+        def capture(path, key, *, body=None, **kwargs):
+            sent.update(body or {})
+            return b"ID3"
+        original, tts._request = tts._request, capture
+        self.addCleanup(lambda: setattr(tts, "_request", original))
+        tts.synthesize("机の上。", "V1", "key", cache_dir=self.dir)
+        self.assertEqual(sent["text"], "机の上。")
+
+    def test_a_pinned_sentence_keeps_its_voice(self):
+        picked = tts.assign_voices(["机の上。"], self.voices, {"机の上。": "Sakura"})
+        self.assertEqual(picked["机の上。"][0], "Sakura")
+
+    def test_a_pin_naming_an_absent_voice_falls_back_to_the_hash(self):
+        """その日のボイス一覧に無い名前で全文が無音になっては困る。"""
+        picked = tts.assign_voices(["机の上。"], self.voices, {"机の上。": "Kozy"})
+        self.assertEqual(picked, tts.assign_voices(["机の上。"], self.voices))
+
+    def test_a_pin_survives_a_round_trip_and_can_be_lifted(self):
+        tts.save_override("机の上。", "Riku", self.dir)
+        self.assertEqual(tts.load_overrides(self.dir), {"机の上。": "Riku"})
+        tts.save_override("机の上。", "", self.dir)
+        self.assertEqual(tts.load_overrides(self.dir), {})
+
+    def test_no_pins_file_is_not_an_error(self):
+        self.assertEqual(tts.load_overrides(self.dir), {})
+
+    def speaks(self, by_voice: dict):
+        """声ごとに決まった聞き取りを返す。どの声で録ったかは voice_id で分かる。"""
+        current = {}
+        def fake(path, key, **kwargs):
+            if path.startswith("/v1/text-to-speech"):
+                current["voice"] = path.rsplit("/", 1)[-1]
+                return b"ID3" + current["voice"].encode()[:4]
+            return json.dumps({"text": by_voice[current["voice"]], "words": []}).encode()
+        original, tts._request = tts._request, fake
+        self.addCleanup(lambda: setattr(tts, "_request", original))
+
+    def test_a_voice_that_keeps_misreading_hands_the_sentence_over(self):
+        text = "祖父は学者だ。"
+        tts.save_override(text, "Riku", self.dir)              # 出発点を決めておく
+        self.speaks({tts.KNOWN_VOICES["riku"]: "ザフトは学者だ",
+                     tts.KNOWN_VOICES["sakura"]: "祖父は学者だ"})
+        urls, note = tts.speak_page([text], self.dir / "頁.html", voice="Riku,Sakura",
+                                    cache_dir=self.dir, key_file=self.keyfile,
+                                    checks={text: [("祖父", "そふ")]}, attempts=2,
+                                    workers=1)
+        self.assertEqual(urls[text]["voice"], "Sakura")        # 読めたほうが載る
+        self.assertIn("読み確認 1/1文一致", note)
+
+    def test_when_no_voice_manages_it_the_closest_one_is_kept(self):
+        text = "帆立貝を焼いた。"
+        tts.save_override(text, "Riku", self.dir)
+        self.speaks({tts.KNOWN_VOICES["riku"]: "ハナテガイを焼いた",     # 1語ちがう
+                     tts.KNOWN_VOICES["sakura"]: "ハナテ貝を焼いだ"})    # やはり1語
+        urls, note = tts.speak_page([text], self.dir / "頁.html", voice="Riku,Sakura",
+                                    cache_dir=self.dir, key_file=self.keyfile,
+                                    checks={text: [("帆立貝", "ほたてがい")]}, attempts=2,
+                                    workers=1)
+        self.assertEqual(len(urls), 1)                         # 再生ボタンは残る
+        self.assertIn("要確認 1文", note)
+
+
+class VoiceVoxReadingTest(unittest.TestCase):
+    """VOICEVOXは合成する前に読みをカナで返す。ページのふりがなと突き合わせるのが
+    ElevenLabs時代の「作ってから聞き取り直す」の置き換え — こちらは推測ではない。"""
+
+    def test_the_engines_reading_is_compared_with_the_page(self):
+        checks = [("祖父", "そふ"), ("類人猿", "るいじんえん")]
+        kana = "ソ'フワ/ルイジ'ンエンノ/ケンキュウデ'"
+        self.assertEqual(voicevox.reading_misses(checks, kana), [])
+
+    def test_a_word_the_engine_reads_differently_is_caught(self):
+        """実際に出たもの：猿人をサルジンと読んだ（正しくはエンジン）。"""
+        self.assertEqual(
+            voicevox.reading_misses([("猿人", "えんじん")], "サル'ジンノ/カセキガ'"),
+            ["猿人"])
+
+    def test_long_vowels_are_accepted_either_way(self):
+        """エンジンは ユウメエ と書き、ページは ゆうめい と書く。ユーザー辞書から
+        来た読みは ドケイ とイのまま返る。どちらの綴りも同じ音なので通す。"""
+        self.assertEqual(voicevox.reading_misses([("有名", "ゆうめい")], "ユウメエナ'"), [])
+        self.assertEqual(voicevox.reading_misses([("時計", "どけい")], "メザマシドケイ'"), [])
+        self.assertEqual(voicevox.reading_misses([("研究", "けんきゅう")], "ケンキュウデ'"), [])
+
+    def test_folding_does_not_reach_across_a_word_boundary(self):
+        """ので＋いそいで を ノデエソイデ と畳んでしまい、探している イソ が
+        消えた。エンジン側は畳まない。"""
+        self.assertEqual(
+            voicevox.reading_misses([("急", "いそ")], "デンワガ/ナッタ'ノデ/イソ'イデ/デタ'"),
+            [])
+        self.assertEqual(
+            voicevox.reading_misses([("上", "うえ")], "アタマノ/ウエ'デ"), [])
+
+    def test_dakuten_spellings_are_folded(self):
+        self.assertEqual(voicevox.reading_misses([("貝塚", "かいづか")], "カイズカ'ガ"), [])
+
+    def test_the_dictionary_is_part_of_the_cache_key(self):
+        """猿人を教えたら、もう作ってある文にもそれが届かなければならない。"""
+        base = voicevox.cache_key("文。", 2, "0.25.2", "m4a", "aaa")
+        self.assertNotEqual(base, voicevox.cache_key("文。", 2, "0.25.2", "m4a", "bbb"))
+        self.assertNotEqual(base, voicevox.cache_key("文。", 3, "0.25.2", "m4a", "aaa"))
+        self.assertNotEqual(base, voicevox.cache_key("文。", 2, "0.26.0", "m4a", "aaa"))
+        self.assertEqual(base, voicevox.cache_key("文。", 2, "0.25.2", "m4a", "aaa"))
+
+    def test_a_pinned_sentence_keeps_its_speaker(self):
+        voices = [("四国めたん", 2), ("玄野武宏", 11)]
+        picked = voicevox.assign_voices(["文。"], voices, {"文。": "玄野武宏"})
+        self.assertEqual(picked["文。"][0], "玄野武宏")
+
+    def test_the_credit_names_the_speakers_actually_heard(self):
+        """利用規約がクレジット表記を求めている。"""
+        credit = voicevox.credit({"a": {"src": "x", "voice": "四国めたん"},
+                                  "b": {"src": "y", "voice": "青山龍星"}})
+        self.assertIn("VOICEVOX", credit)
+        self.assertIn("四国めたん", credit)
+        self.assertIn("青山龍星", credit)
+        self.assertEqual(voicevox.credit({}), "")
+
+    def test_the_footer_carries_the_credit(self):
+        page = build_page.build(sample_content(), {}, audio_credit="音声：VOICEVOX（X）")
+        self.assertIn("音声：VOICEVOX（X）", page)
+        self.assertNotIn("音声：VOICEVOX", build_page.build(sample_content(), {}))
+
+
+JSC = Path("/System/Library/Frameworks/JavaScriptCore.framework"
+           "/Versions/A/Helpers/jsc")
+
+# 三：横画3本、上から下へ、どれも左から右へ。横画ばかりなので**向きだけでは
+# 見分けがつかない** — 順番の間違いを捕まえられるかがここで分かる。
+SAN = [[[0.2, 0.25], [0.5, 0.25], [0.8, 0.25]],
+       [[0.3, 0.50], [0.5, 0.50], [0.7, 0.50]],
+       [[0.15, 0.75], [0.5, 0.75], [0.85, 0.75]]]
+
+# 十：横画（左→右）のあとに縦画（上→下）。
+JUU = [[[0.15, 0.5], [0.5, 0.5], [0.85, 0.5]],
+       [[0.5, 0.15], [0.5, 0.5], [0.5, 0.85]]]
+
+
+def reverse_stroke(stroke):
+    return list(reversed(stroke))
+
+
+def shift(strokes, dx, dy):
+    return [[[x + dx, y + dy] for x, y in stroke] for stroke in strokes]
+
+
+class StrokeGradingTest(unittest.TestCase):
+    """書き取りの採点（GRADE_JS）を、ページに載るのと同じソースのまま試す。
+
+    採点はDOMを触らない純粋な計算にしてあるので、macOS同梱の jsc に
+    `build_page.GRADE_JS` をそのまま読ませれば、ブラウザ無しで確かめられる。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if not JSC.exists():
+            raise unittest.SkipTest(f"jsc が無い（{JSC}）")
+
+    def grade(self, user, model):
+        """__kanjiGrade(user, model) を jsc で走らせ、{ok, notes} を返す。"""
+        harness = ("var __out = __kanjiGrade(%s, %s);\n"
+                   'print(JSON.stringify(__out));\n'
+                   % (json.dumps(user), json.dumps(model)))
+        with tempfile.TemporaryDirectory() as tmp:
+            grader = Path(tmp) / "grade.js"
+            script = Path(tmp) / "run.js"
+            grader.write_text(build_page.GRADE_JS, encoding="utf-8")
+            script.write_text(harness, encoding="utf-8")
+            done = subprocess.run([str(JSC), str(grader), str(script)],
+                                  capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return json.loads(done.stdout.strip().splitlines()[-1])
+
+    def test_a_correct_character_passes(self):
+        self.assertTrue(self.grade(SAN, SAN)["ok"])
+        self.assertTrue(self.grade(JUU, JUU)["ok"])
+
+    def test_moving_the_whole_character_is_not_an_error(self):
+        """マスの中で寄せて書いても字は同じ。平行移動は採点しない、が指示。"""
+        for dx, dy in ((0.1, 0.1), (-0.12, 0.05), (0, -0.15)):
+            with self.subTest(dx=dx, dy=dy):
+                self.assertTrue(self.grade(shift(SAN, dx, dy), SAN)["ok"])
+
+    def test_the_strokes_in_the_wrong_order_are_named(self):
+        """三を下から書いた場合。3本とも同じ向きなので、**向きを見ていた
+        以前のやり方では原理的に気づけなかった**（cosはどれも1になる）。"""
+        verdict = self.grade([SAN[2], SAN[1], SAN[0]], SAN)
+        self.assertFalse(verdict["ok"])
+        self.assertIn("3画目のあとに2画目を書いています", verdict["notes"])
+
+    def test_swapping_two_strokes_names_both_numbers(self):
+        """十を縦から書いた場合。"""
+        verdict = self.grade([JUU[1], JUU[0]], JUU)
+        self.assertFalse(verdict["ok"])
+        self.assertIn("2画目のあとに1画目を書いています", verdict["notes"])
+
+    def test_a_stroke_written_backwards_is_named_by_its_number(self):
+        """逆向きは「どの画か」まで言う。対応づけが形で取れているので、
+        書いた順ではなくお手本の画番号で言える。"""
+        verdict = self.grade([SAN[0], reverse_stroke(SAN[1]), SAN[2]], SAN)
+        self.assertFalse(verdict["ok"])
+        self.assertIn("2画目を逆向きに書いています", verdict["notes"])
+
+        verdict = self.grade([JUU[0], reverse_stroke(JUU[1])], JUU)
+        self.assertIn("2画目を逆向きに書いています", verdict["notes"])
+
+    def test_a_backwards_stroke_is_still_found_when_the_order_is_also_wrong(self):
+        """順番と向きの両方が違っても、向きの指摘は正しい画に付く。"""
+        verdict = self.grade([SAN[2], reverse_stroke(SAN[0]), SAN[1]], SAN)
+        self.assertIn("1画目を逆向きに書いています", verdict["notes"])
+
+    def test_untidy_handwriting_still_passes(self):
+        """手書きはぶれる。0.06マス幅のぶれで文句を言い出すようでは使えない。"""
+        seed = [7]
+
+        def jitter():
+            seed[0] = (seed[0] * 1103515245 + 12345) % 2147483648
+            return seed[0] / 2147483648 - 0.5
+
+        untidy = [[[x + jitter() * 0.06, y + jitter() * 0.06] for x, y in stroke]
+                  for stroke in JUU]
+        self.assertTrue(self.grade(untidy, JUU)["ok"])
+
+    def test_a_stroke_that_doubles_back_is_still_caught(self):
+        """察の8画目のような折り返す画。**弧長は長いのに端点は近い**ので、
+        「差が画の長さに比例するはず」と考えると取りこぼす。比で見れば拾える。"""
+        hook = [[[0.53, 0.29], [0.68, 0.27], [0.69, 0.31], [0.58, 0.43]]]
+        model = hook + [[[0.2, 0.7], [0.8, 0.7]]]
+        user = [reverse_stroke(model[0]), model[1]]
+        self.assertIn("1画目を逆向きに書いています", self.grade(user, model)["notes"])
+
+    def test_a_short_stroke_is_left_alone(self):
+        """短い画は向きを問わない。2026-09-01にキャッシュ済みの246字で試した限り、
+        逆向きを見落とすのはこの線引きの下だけだった（曇・避 の9画目、弧長0.074/0.078）。
+        指の書き取りでその長さの画の「どちらから始めたか」を採点しても仕方がない。"""
+        tiny = [[[0.50, 0.30], [0.55, 0.33]]]          # 弧長 0.058
+        model = tiny + [[[0.2, 0.7], [0.8, 0.7]]]
+        self.assertTrue(self.grade([reverse_stroke(model[0]), model[1]], model)["ok"])
+
+    def test_a_dot_has_no_direction_to_get_wrong(self):
+        """点のように短い画は、どちらから打っても同じ。向きを問わない。"""
+        dot = [[[0.5, 0.2], [0.52, 0.24]], [[0.2, 0.6], [0.8, 0.6]]]
+        self.assertTrue(self.grade([reverse_stroke(dot[0]), dot[1]], dot)["ok"])
+
+    def test_the_stroke_count_is_still_reported(self):
+        verdict = self.grade(SAN[:2], SAN)
+        self.assertIn("3画のところを2画で書いています", verdict["notes"])
+
+    def test_nothing_written_is_not_graded(self):
+        self.assertEqual(self.grade([], SAN)["notes"], [])
+
+    def test_at_most_three_notes(self):
+        """指摘しすぎない。"""
+        wrong = [reverse_stroke(s) for s in reversed(SAN)]
+        self.assertLessEqual(len(self.grade(wrong, SAN)["notes"]), 3)
+
+
+class FuriganaCheckTest(unittest.TestCase):
+    """ビルドの中の読みの確認は再生ボタンの付く文しか見ていない。--furigana は
+    ページのふりがな全部を並べる（単語表・意味・書き順・クイズの解説まで）。"""
+
+    def test_every_furigana_bearing_field_is_listed(self):
+        content = {"kanji": [{"char": "角", "meaning": "かど ／ corner",
+                              "order_note": "上の<ruby>左<rt>ひだり</rt></ruby>払い→…",
+                              "words": [{"w": "三角形", "r": "さんかくけい",
+                                         "m": "<ruby>辺<rt>へん</rt></ruby>が3つ"}],
+                              "examples": ["<ruby>角<rt>かど</rt></ruby>を曲がる。"]}],
+                   "quiz": [{"q": "この<ruby>角<rt>かど</rt></ruby>。",
+                             "note": "<ruby>訓読<rt>くんよ</rt></ruby>み。"}]}
+        labels = [label for label, _, _ in voicevox.furigana_targets(content)]
+        for where in ("意味", "書き順", "単語 三角形", "例文1", "クイズ1", "クイズ1 解説"):
+            self.assertTrue(any(where in label for label in labels),
+                            f"{where} が漏れている: {labels}")
+
+    def test_only_the_sentences_with_a_play_button_count_as_spoken(self):
+        """声になるのは例文とクイズの問題文だけ（page_sentences と同じ）。単語表や
+        解説のふりがなはページに出るが読み上げられない。"""
+        spoken = {label for label, _, is_spoken in
+                  voicevox.furigana_targets(sample_content()) if is_spoken}
+        self.assertTrue(all("例文" in l or l.startswith("クイズ") for l in spoken), spoken)
+        self.assertFalse(any("解説" in l or "単語" in l for l in spoken), spoken)
+
+    def test_the_word_table_is_rebuilt_into_ruby_so_it_can_be_checked(self):
+        """単語表は w/r の二つ組で <ruby> ではないので、そのままでは検査に掛からない。"""
+        content = {"kanji": [{"char": "駐", "words": [{"w": "駐輪", "r": "ちゅうりん"}]}]}
+        text = next(t for label, t, _ in voicevox.furigana_targets(content)
+                    if "単語 駐輪" in label)
+        self.assertEqual(build_page.reading_checks(text), [("駐輪", "ちゅうりん")])
+
+    def test_a_silent_fragment_only_asks_about_compounds(self):
+        """声にならない断片の中の1字は、単独で読ませても答えにならない：解説の
+        「実」は読みの名前を言う引用でエンジンは ミ と読み、意味の「終わり」の 終 は
+        シュウ になる。2026-09-01は絞らないと342箇所中9箇所が食い違い、9箇所とも
+        本物の誤りではなかった。絞れば0。"""
+        pairs = [("実", "じつ"), ("終", "お"), ("翼幅", "よくはば")]
+        self.assertEqual(voicevox.checkable(pairs, False), [("翼幅", "よくはば")])
+
+    def test_a_spoken_sentence_asks_about_everything(self):
+        """読み上げられる以上、1字の訓読みも音になって出る。全部訊く。"""
+        pairs = [("実", "じつ"), ("終", "お"), ("翼幅", "よくはば")]
+        self.assertEqual(voicevox.checkable(pairs, True), pairs)
 
 
 if __name__ == "__main__":

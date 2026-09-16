@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 .kanjivg_cache/
+
 .claude/settings.local.json
 
 # まとめて を押したときのクイズの成績。次のビルドが履歴に取り込んで消す一時ファイル
@@ -24,3 +25,14 @@ graphify-out/
 
 # macOS
 .DS_Store
+
+# VOICEVOXで作った音声のキャッシュ。ローカルで作り直せる（無料）ので追跡しない
+.vv_cache/
+
+# Style-BERT-VITS2 を動かすためのvenv（作り直せる）
+.sbv2venv/
+# ダウンロードしたモデル（HuggingFaceから取り直せる）
+.sbv2_models/
+
+# Style-BERT-VITS2の音声キャッシュ（作り直せる）
+.sbv2_cache/

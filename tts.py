@@ -30,8 +30,11 @@ import argparse
 import concurrent.futures
 import hashlib
 import json
+import re
 import sys
 import time
+import unicodedata
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -40,7 +43,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 
 # The key. A file rather than an env var because the daily build runs under
-# launchd, which inherits nothing from Pedro's shell — an exported variable in
+# launchd, which inherits nothing from the login shell — an exported variable in
 # .zshrc would work interactively and then silently produce a page with no
 # audio every morning. Gitignored.
 KEY_FILE = HERE / ".elevenlabs_key"
@@ -50,7 +53,7 @@ CACHE_DIR = HERE / ".tts_cache"
 
 API = "https://api.elevenlabs.io"
 
-# Pedro's two Japanese voices, by id. Kept here so the daily build never spends
+# The Japanese voices used here, by id. Kept here so the daily build never spends
 # a round trip (or a failure mode) on looking a name up: /v2/voices only finds
 # a voice already added to the account, and a page with no audio because a
 # voice search 404'd at 9:00 is a worse outcome than a hard-coded id.
@@ -79,6 +82,14 @@ DEFAULT_LANGUAGE = "ja"
 # between a 2MB and an 8MB folder per page.
 DEFAULT_FORMAT = "mp3_44100_64"
 DEFAULT_WORKERS = 3               # 同時リクエスト数（プランの上限に合わせる）
+# 読み上げたものを聞き取り直して、書いてある読みと合っているか確かめるモデル。
+DEFAULT_STT_MODEL = "scribe_v1"
+# 1文につき何回まで録り直すか（1回目を含む）。v3は同じ文でも読みが揺れるので、
+# 読み違えた回は捨ててもう一度引けばたいてい直る。3回でだめなら諦めて一番よい
+# 回を採る — 直らない文のために毎朝クレジットを溶かすほうが困る。
+DEFAULT_ATTEMPTS = 3
+# 出だしの潰れは、文の前に読点を置いても・波形を測っても解けなかった。2026-08-31の
+# 顛末は SKILL.md の「出だしがはっきりしないとき」に書いてある。読み替えは声を替える。
 
 TIMEOUT = 120
 RETRIES = 3
@@ -123,20 +134,26 @@ def load_key(key_file: Path = KEY_FILE) -> str:
 
 
 def _request(path: str, key: str, *, body: dict | None = None,
-             query: dict | None = None, accept: str = "application/json") -> bytes:
+             query: dict | None = None, accept: str = "application/json",
+             raw_body: bytes | None = None, content_type: str = "") -> bytes:
     """One call to the ElevenLabs API, retried on the failures worth retrying.
 
     429 (rate limit) and 5xx get an exponential backoff; 401/404/422 are the
     caller's fault and come straight back as TTSError with the API's own
     message, which is usually specific enough to act on.
+
+    `body` is JSON; `raw_body` with `content_type` is for speech-to-text, which
+    wants the mp3 as multipart/form-data rather than JSON.
     """
     url = f"{API}{path}"
     if query:
         url += "?" + urllib.parse.urlencode(query)
-    data = json.dumps(body).encode("utf-8") if body is not None else None
+    data = json.dumps(body).encode("utf-8") if body is not None else raw_body
     headers = {"xi-api-key": key, "Accept": accept}
-    if data is not None:
+    if body is not None:
         headers["Content-Type"] = "application/json"
+    elif raw_body is not None:
+        headers["Content-Type"] = content_type
 
     last = ""
     for attempt in range(RETRIES):
@@ -160,7 +177,7 @@ def _request(path: str, key: str, *, body: dict | None = None,
 def resolve_voice(name: str, key: str, cache_dir: Path = CACHE_DIR) -> str:
     """The voice_id for a voice name, looked up once and remembered.
 
-    A name is what Pedro asked for ("Riku"); the API wants an id. KNOWN_VOICES
+    A name is what the caller gives ("Riku"); the API wants an id. KNOWN_VOICES
     answers for his own two without any call at all; anything else is looked up
     once and remembered in the cache folder.
 
@@ -217,9 +234,126 @@ def cache_key(text: str, voice_id: str, model: str, fmt: str,
     return hashlib.sha1(stamp.encode("utf-8")).hexdigest()
 
 
+# --------------------------------------------------------------------------- #
+# Checking what the voice actually said
+# --------------------------------------------------------------------------- #
+
+
+# ISO 639-1 for the TTS endpoint, 639-3 for speech-to-text. The same "日本語"
+# either way, spelled differently by the two APIs.
+STT_LANGUAGE = {"ja": "jpn"}
+
+_PUNCT = re.compile(r"[\s、。，．,.!！?？「」『』（）()…・ー〜]")
+_DIGITS = re.compile(r"[0-9]+")
+_KANJI_RUN = re.compile(r"[一-鿿々]+")
+_NUM = "〇一二三四五六七八九"
+
+
+def _kanji_number(value: int) -> str:
+    """12 -> 十二. Only up to 999, which is as far as a practice sentence
+    counts (十個, 二メートル, 七時)."""
+    if value < 10:
+        return _NUM[value]
+    if value < 100:
+        tens, ones = divmod(value, 10)
+        return ("" if tens == 1 else _NUM[tens]) + "十" + (_NUM[ones] if ones else "")
+    hundreds, rest = divmod(value, 100)
+    return ("" if hundreds == 1 else _NUM[hundreds]) + "百" + (_kanji_number(rest) if rest else "")
+
+
+def normalize_heard(text: str) -> str:
+    """Both sides of the comparison, reduced to what a reading check cares about.
+
+    Punctuation and spacing go (the voice's phrasing is not the transcript's to
+    reproduce), and 10年 becomes 十年 — Scribe writes numbers as digits whatever
+    the page wrote, and that is a spelling difference, not a misreading.
+    """
+    text = unicodedata.normalize("NFKC", str(text))
+    text = _DIGITS.sub(lambda m: _kanji_number(int(m.group())) if int(m.group()) < 1000
+                       else m.group(), text)
+    return _PUNCT.sub("", text)
+
+
+def kanji_runs(text: str) -> list[tuple[str, str]]:
+    """Fallback reading checks for a sentence with no furigana to go on: every
+    run of kanji in it, with no reading to accept in its place."""
+    return [(run, "") for run in _KANJI_RUN.findall(normalize_heard(text))]
+
+
+def reading_misses(checks: list[tuple[str, str]], heard: str) -> list[str]:
+    """Which of a sentence's words the transcript says were read wrong.
+
+    Each check is (書き方, ふりがな) taken from the page's own ruby — the reading
+    the learner is being taught, which step 4 verified on jisho. A word passes if the
+    transcript contains either one:
+
+    - the kanji itself, meaning Scribe heard the word and wrote it back (祖父);
+    - or its kana reading, because Scribe often writes in kana what the page
+      wrote in kanji (分かる -> わかる, 付いた -> ついた). Same sound, so nothing
+      is wrong with the audio.
+
+    What survives both is a genuine divergence: 祖父 coming back as ザフト, 鶏
+    as 鳥, 尾翼 as 微弱. The check is deliberately one-directional — kana in the
+    page that Scribe wrote as kanji (そうじ -> 掃除) is not looked at at all,
+    because kana is the one thing a voice cannot misread.
+    """
+    heard = normalize_heard(heard)
+    missed = []
+    for base, reading in checks:
+        base = normalize_heard(base)
+        if base and base in heard:
+            continue
+        if reading and normalize_heard(reading) in heard:
+            continue
+        missed.append(base)
+    return missed
+
+
+def transcribe(audio: bytes, key: str, *, model: str = DEFAULT_STT_MODEL,
+               language: str = DEFAULT_LANGUAGE) -> dict:
+    """What the mp3 actually says, via ElevenLabs speech-to-text.
+
+    Returns the whole record, not just the text: the per-word timestamps that
+    come with it for free are what the clarity check reads to find where the
+    first word starts.
+    """
+    boundary = uuid.uuid4().hex
+    fields = {"model_id": model}
+    if language:
+        fields["language_code"] = STT_LANGUAGE.get(language, language)
+    parts = []
+    for name, value in fields.items():
+        parts.append(f"--{boundary}\r\nContent-Disposition: form-data; "
+                     f'name="{name}"\r\n\r\n{value}\r\n'.encode("utf-8"))
+    parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; "
+                 f'filename="clip.mp3"\r\nContent-Type: audio/mpeg\r\n\r\n'.encode("utf-8"))
+    parts.append(audio + b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+    body = b"".join(parts)
+    raw = _request("/v1/speech-to-text", key, raw_body=body,
+                   content_type=f"multipart/form-data; boundary={boundary}")
+    heard = json.loads(raw)
+    return {"text": heard.get("text", ""), "words": heard.get("words") or []}
+
+
+def heard_path(cache_dir: Path, name: str) -> Path:
+    """Where the transcript of a cached clip is kept: <key>.heard.json, beside
+    the mp3.
+
+    Its presence is the record that this clip has been listened to. A clip made
+    before the check existed has no file and gets checked on the next build; one
+    that has been checked is never checked again, however it came out — the
+    sentences that stay wrong after three takes are wrong for a reason, and
+    paying to rediscover that every morning would be its own bug.
+    """
+    return cache_dir / f"{name}.heard.json"
+
+
 def synthesize(text: str, voice_id: str, key: str, *, model: str = DEFAULT_MODEL,
                fmt: str = DEFAULT_FORMAT, cache_dir: Path = CACHE_DIR,
-               language: str = DEFAULT_LANGUAGE) -> bytes:
+               language: str = DEFAULT_LANGUAGE,
+               checks: list[tuple[str, str]] | None = None,
+               attempts: int = 1, stt_model: str = DEFAULT_STT_MODEL) -> bytes:
     """One sentence as mp3 bytes, from the cache when we've said it before.
 
     Deliberately sends no voice_settings. Omitting the field makes the API use
@@ -229,29 +363,104 @@ def synthesize(text: str, voice_id: str, key: str, *, model: str = DEFAULT_MODEL
     Sakura's own settings (and silently dropped style, speed and
     use_speaker_boost); that is most of why the same sentence sounded better on
     the website than on this page.
+
+    With `checks` (the page's own furigana, as (書き方, ふりがな) pairs) each take
+    is transcribed and compared against them, and a take that misreads a word is
+    thrown away and drawn again, up to `attempts` times. v3 does not read the
+    same sentence the same way twice — that is exactly why a bad take is worth
+    re-rolling, and why one bad take was never evidence that the sentence
+    couldn't be read. If no take comes back clean, the closest one is kept: a
+    sentence with a play button that mispronounces one word is still better than
+    a sentence with no play button.
     """
+    if attempts < 2:
+        checks = None        # 録り直せないなら聞き直す意味もない
     name = cache_key(text, voice_id, model, fmt, language)
     cached = cache_dir / f"{name}.mp3"
-    if cached.exists():
+    heard = heard_path(cache_dir, name)
+    if cached.exists() and (heard.exists() or not checks or attempts < 2):
         return cached.read_bytes()
 
     body = {"text": text, "model_id": model}
     if language:
         body["language_code"] = language
-    audio = _request(f"/v1/text-to-speech/{voice_id}", key,
-                     body=body, query={"output_format": fmt}, accept="audio/mpeg")
-    if not audio:
-        raise TTSError(f"空の音声が返りました: {text[:20]}")
+
+    best: tuple[bytes, str, list[str]] | None = None
+    for attempt in range(max(1, attempts) if checks else 1):
+        if cached.exists() and attempt == 0:
+            # An unjudged clip from before the check existed. Listen to what we
+            # already have before paying to say it again.
+            audio = cached.read_bytes()
+        else:
+            audio = _request(f"/v1/text-to-speech/{voice_id}", key,
+                             body=body, query={"output_format": fmt}, accept="audio/mpeg")
+        if not audio:
+            raise TTSError(f"空の音声が返りました: {text[:20]}")
+        if not checks:
+            best = (audio, "", [])
+            break
+        try:
+            heard_now = transcribe(audio, key, model=stt_model, language=language)
+        except TTSError as error:
+            # Losing the transcript costs us the check, not the clip.
+            print(f"  読みを確かめられませんでした: {text[:24]}… — {error}", file=sys.stderr)
+            best = (audio, "", [])
+            break
+        said = heard_now["text"]
+        missed = reading_misses(checks, said)
+        if best is None or len(missed) < len(best[2]):
+            best = (audio, said, missed)
+        if not missed:
+            break
+
+    audio, said, missed = best                      # 少なくとも1回は回っている
     cache_dir.mkdir(parents=True, exist_ok=True)
     cached.write_bytes(audio)
+    if checks:
+        heard.write_text(json.dumps({"text": text, "heard": said, "missed": missed},
+                                    ensure_ascii=False), encoding="utf-8")
     return audio
 
 
-def assign_voices(texts: list[str], voices: list[tuple[str, str]]
+OVERRIDES = "voices.json"
+
+
+def load_overrides(cache_dir: Path = CACHE_DIR) -> dict[str, str]:
+    """Sentences assigned a voice by hand, text -> voice name.
+
+    The escape hatch for what no check can hear. Scribe transcribes a clip by
+    what the sentence must have been, not by what the voice actually produced,
+    so a mangled 机 still comes back as 机 — on 2026-08-31 Shizuka read it as
+    「くえ」 and then as 「くくえ」 and the transcript said 机 every time. When
+    the listener's ear catches one of those, `--revoice` writes it here and the
+    sentence keeps the voice he chose.
+    """
+    path = cache_dir / OVERRIDES
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def save_override(text: str, voice_name: str, cache_dir: Path = CACHE_DIR) -> None:
+    """Pin one sentence to one voice, or drop the pin when voice_name is ""."""
+    overrides = load_overrides(cache_dir)
+    if voice_name:
+        overrides[text] = voice_name
+    else:
+        overrides.pop(text, None)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    (cache_dir / OVERRIDES).write_text(json.dumps(overrides, ensure_ascii=False, indent=1),
+                                       encoding="utf-8")
+
+
+def assign_voices(texts: list[str], voices: list[tuple[str, str]],
+                  overrides: dict[str, str] | None = None
                   ) -> dict[str, tuple[str, str]]:
     """Which voice reads which sentence: text -> (name, voice_id).
 
-    Pedro wants the two voices alternating unpredictably through a page rather
+    The two voices should alternate unpredictably through a page rather
     than one narrator throughout, so the choice is made per sentence — but from
     a hash of the sentence, not random(). The spread is the same 50/50 either
     way; the difference is that a hash gives the *same* answer next time, so
@@ -261,8 +470,14 @@ def assign_voices(texts: list[str], voices: list[tuple[str, str]]
     """
     if not voices:
         return {}
+    by_name = {name.lower(): (name, vid) for name, vid in voices}
+    overrides = overrides or {}
     picked = {}
     for text in texts:
+        chosen = by_name.get(overrides.get(text, "").lower())
+        if chosen:
+            picked[text] = chosen
+            continue
         digest = hashlib.sha1(text.encode("utf-8")).digest()
         picked[text] = voices[digest[0] % len(voices)]
     return picked
@@ -272,6 +487,8 @@ def synthesize_all(pairs: dict[str, str], key: str, *,
                    model: str = DEFAULT_MODEL, fmt: str = DEFAULT_FORMAT,
                    cache_dir: Path = CACHE_DIR, workers: int = DEFAULT_WORKERS,
                    language: str = DEFAULT_LANGUAGE,
+                   checks: dict[str, list[tuple[str, str]]] | None = None,
+                   attempts: int = 1, stt_model: str = DEFAULT_STT_MODEL,
                    ) -> tuple[dict[str, bytes], list[str]]:
     """Every sentence at once, a few requests in flight at a time.
 
@@ -279,16 +496,24 @@ def synthesize_all(pairs: dict[str, str], key: str, *,
     assign_voices). Returns (text -> mp3 bytes, texts that failed). A failure
     is not fatal: that sentence simply loses its play button, and the next
     build will try it again because nothing was cached for it.
+
+    `checks` maps a sentence to the readings it has to come back with; see
+    synthesize(). A cached clip that has never been listened to goes through the
+    pool like a new one, so the check reaches yesterday's audio too — but it is
+    transcribed, not re-synthesized, unless it turns out to be wrong.
     """
     unique = [t for t in pairs if t.strip()]
     clips: dict[str, bytes] = {}
+    checks = checks or {}
 
     # Anything already cached is free and instant — take it here so the pool
     # only ever holds real network work.
     pending = []
     for text in unique:
-        cached = cache_dir / f"{cache_key(text, pairs[text], model, fmt, language)}.mp3"
-        if cached.exists():
+        name = cache_key(text, pairs[text], model, fmt, language)
+        cached = cache_dir / f"{name}.mp3"
+        judged = heard_path(cache_dir, name).exists() or not checks.get(text) or attempts < 2
+        if cached.exists() and judged:
             clips[text] = cached.read_bytes()
         else:
             pending.append(text)
@@ -296,7 +521,9 @@ def synthesize_all(pairs: dict[str, str], key: str, *,
     if pending:
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
             futures = {pool.submit(synthesize, text, pairs[text], key, model=model,
-                                   fmt=fmt, cache_dir=cache_dir, language=language): text
+                                   fmt=fmt, cache_dir=cache_dir, language=language,
+                                   checks=checks.get(text), attempts=attempts,
+                                   stt_model=stt_model): text
                        for text in pending}
             for future in concurrent.futures.as_completed(futures):
                 text = futures[future]
@@ -335,7 +562,7 @@ def write_clips(clips: dict[str, bytes], out_dir: Path,
     """Drop the mp3s next to the page and return text -> {"src", "voice"}.
 
     The voice name rides along so the page can say who is speaking: with two
-    voices alternating, a play button that doesn't name one leaves Pedro
+    voices alternating, a play button that doesn't name one leaves the listener
     unable to tell which he preferred.
 
     Files are named by their cache key so the same sentence is one file, and
@@ -360,10 +587,39 @@ def write_clips(clips: dict[str, bytes], out_dir: Path,
     return urls
 
 
+def heard_record(text: str, voice_id: str, *, model: str, fmt: str,
+                 language: str, cache_dir: Path) -> dict | None:
+    """What was heard when this sentence was last read by this voice, or None
+    if that pairing has never been judged."""
+    path = heard_path(cache_dir, cache_key(text, voice_id, model, fmt, language))
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def misread(texts: list[str], pairs: dict[str, tuple[str, str]], *, model: str,
+            fmt: str, language: str, cache_dir: Path) -> list[tuple[str, list[str]]]:
+    """The sentences whose clips are still misread after every voice has tried,
+    read back out of the .heard.json files. Reported so the listener knows which play
+    buttons to distrust rather than having to catch them by ear."""
+    out = []
+    for text in texts:
+        if text not in pairs:
+            continue
+        record = heard_record(text, pairs[text][1], model=model, fmt=fmt,
+                              language=language, cache_dir=cache_dir)
+        if record and record.get("missed"):
+            out.append((text, record["missed"]))
+    return out
+
+
 def speak_page(texts: list[str], page: Path, *, voice: str = DEFAULT_VOICE,
                voice_id: str = "", model: str = DEFAULT_MODEL, fmt: str = DEFAULT_FORMAT,
                cache_dir: Path = CACHE_DIR, key_file: Path = KEY_FILE,
-               workers: int = DEFAULT_WORKERS, language: str = DEFAULT_LANGUAGE
+               workers: int = DEFAULT_WORKERS, language: str = DEFAULT_LANGUAGE,
+               checks: dict[str, list[tuple[str, str]]] | None = None,
+               attempts: int = 1, stt_model: str = DEFAULT_STT_MODEL
                ) -> tuple[dict[str, dict[str, str]], str]:
     """Everything a page needs, in one call: text -> {"src", "voice"}, plus a
     one-line note for the build's console output.
@@ -394,10 +650,44 @@ def speak_page(texts: list[str], page: Path, *, voice: str = DEFAULT_VOICE,
     if not voices:
         return {}, "音声なし（ボイスが指定されていません）"
 
-    pairs = assign_voices(texts, voices)
-    clips, failed = synthesize_all({t: v[1] for t, v in pairs.items()}, key,
+    pairs = assign_voices(texts, voices, load_overrides(cache_dir))
+    spoken = {t: v[1] for t, v in pairs.items()}
+    clips, failed = synthesize_all(spoken, key,
                                    model=model, fmt=fmt, cache_dir=cache_dir,
-                                   workers=workers, language=language)
+                                   workers=workers, language=language,
+                                   checks=checks, attempts=attempts, stt_model=stt_model)
+
+    # 同じ声で引き直しても直らない語がある（2026-08-31：Kozyの鶏卵・帆立貝、
+    # Shizukaの文頭の「つ」）。読みが合わない文は声を替えてもう一巡する — 引き直しが
+    # 効くのは読みが揺れるからで、声を替えれば揺れる幅そのものが変わる。
+    if checks and attempts > 1 and len(voices) > 1:
+        def still_wrong() -> list[str]:
+            return [text for text, _ in misread(list(clips), pairs, model=model, fmt=fmt,
+                                                language=language, cache_dir=cache_dir)]
+        for _ in range(len(voices) - 1):
+            wrong = still_wrong()
+            if not wrong:
+                break
+            for text in wrong:
+                pairs[text] = voices[(voices.index(pairs[text]) + 1) % len(voices)]
+            more, _ = synthesize_all({t: pairs[t][1] for t in wrong}, key,
+                                     model=model, fmt=fmt, cache_dir=cache_dir,
+                                     workers=workers, language=language,
+                                     checks=checks, attempts=attempts, stt_model=stt_model)
+            clips.update(more)
+        # どの声でも直らなかった文は、いちばんましだった声のクリップに戻す。
+        for text in still_wrong():
+            scored = []
+            for voice in voices:
+                record = heard_record(text, voice[1], model=model, fmt=fmt,
+                                      language=language, cache_dir=cache_dir)
+                if record is not None:
+                    scored.append((len(record.get("missed", [])), voices.index(voice), voice))
+            if scored:
+                pairs[text] = min(scored)[2]
+                cached = cache_dir / f"{cache_key(text, pairs[text][1], model, fmt, language)}.mp3"
+                if cached.exists():
+                    clips[text] = cached.read_bytes()
     try:
         urls = write_clips(clips, audio_dir_for(page), pairs, model, fmt, language)
     except OSError as error:
@@ -414,6 +704,13 @@ def speak_page(texts: list[str], page: Path, *, voice: str = DEFAULT_VOICE,
     note = f"音声 {len(urls)}/{len(texts)}文（{spread or voice}・{model}）"
     if failed:
         note += f"／失敗 {len(failed)}文"
+    if checks and attempts > 1:
+        wrong = misread(list(urls), pairs, model=model, fmt=fmt,
+                        language=language, cache_dir=cache_dir)
+        note += (f"／読み確認 {len(urls) - len(wrong)}/{len(urls)}文一致"
+                 + (f"・要確認 {len(wrong)}文" if wrong else ""))
+        for text, words in wrong:
+            print(f"  読みが合いません（{'・'.join(words)}）: {text}", file=sys.stderr)
     return urls, note
 
 
@@ -435,7 +732,29 @@ def main() -> int:
                         help=f"読み上げる言語（既定：{DEFAULT_LANGUAGE}）")
     parser.add_argument("--cache", type=Path, default=CACHE_DIR,
                         help=f"音声のキャッシュ（既定：{CACHE_DIR.name}）")
+    parser.add_argument("--revoice", metavar="文",
+                        help="この文を --voice の声に固定する（聞いておかしかったとき）。"
+                             "--voice を空にすると固定を外す")
+    parser.add_argument("--redo", metavar="文",
+                        help="この文の録音を捨てて、次のビルドで録り直させる")
     args = parser.parse_args()
+
+    if args.revoice:
+        name = args.voice if args.voice != DEFAULT_VOICE else ""
+        save_override(args.revoice, name, args.cache)
+        print(f"{args.revoice} → {name or '（固定を外しました）'}")
+        return 0
+
+    if args.redo:
+        dropped = 0
+        for name, voice_id in KNOWN_VOICES.items():
+            key = cache_key(args.redo, voice_id, args.model, args.fmt, args.language)
+            for path in (args.cache / f"{key}.mp3", heard_path(args.cache, key)):
+                if path.exists():
+                    path.unlink()
+                    dropped += 1
+        print(f"{args.redo}: {dropped}件を捨てました。次のビルドで録り直します")
+        return 0
 
     key = load_key()
     if not key:
