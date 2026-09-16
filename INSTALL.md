@@ -156,6 +156,11 @@ on `http://127.0.0.1:8765` (`ask_server_port` in `config.json`). Logs go to
 `<output_root>/ask_server.log`. Check it's up with
 `launchctl list | grep kanji-ask-server`.
 
+This server also keeps the durable copy of your quiz answers and traced
+characters, in `.page_state/`. Without it the pages still save your work, but
+only in the browser's own storage — which clearing browsing data erases. Run it
+if you want that work to last.
+
 After changing `ask_server.py`, reload it — the running copy keeps the old code:
 
 ```bash

@@ -11,6 +11,10 @@ config.json
 # まとめて を押したときのクイズの成績。次のビルドが履歴に取り込んで消す一時ファイル
 .quiz_results/
 
+# ページごとの下書き（クイズの答え・書き取りの線・会話id）。ask_server が書く。
+# 個人の学習記録なので追跡しない（ask_server.PAGE_STATE_DIR）
+.page_state/
+
 # 全期間の学習履歴。~/Documents はTCC保護下でlaunchdから読めないためここに置いているが、
 # 個人の学習記録なので追跡はしない（build_page.DEFAULT_HISTORY のコメント参照）
 kanji_history.json

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -588,6 +589,104 @@ class SummaryTargetTest(unittest.TestCase):
         day, target = ask_server.summary_target("/somewhere/content_notadate.json")
         self.assertEqual(day, date.today().isoformat())
         self.assertIn(f"まとめ_{date.today().isoformat()}.html", target)
+
+
+class SavedWorkTest(unittest.TestCase):
+    """Quiz answers and 書き取り strokes have to outlive the browser.
+
+    They used to live only in localStorage. Pages are opened as file:// URLs, so
+    that is just "site data" to the browser: clearing browsing data wipes every
+    page's answers and drawings at once, and a different browser or a private
+    window never sees them. The August 2026 records survived; September's were
+    gone the day the user cleared their data. The page now mirrors to
+    ask_server's /state, and prefers whichever copy was written later.
+    """
+
+    def setUp(self) -> None:
+        self.page = build_page.build(sample_content(), {"雷": SAMPLE_STROKES},
+                                     "/tmp/content_2026-08-02.json", "daily:2026-08-02")
+
+    def test_the_page_mirrors_saved_work_to_the_server(self):
+        self.assertIn("/state", self.page)
+        self.assertIn("sendBeacon", self.page)   # 閉じる瞬間の分を取りこぼさない
+
+    def test_the_quiz_and_the_pads_both_accept_a_newer_server_copy(self):
+        self.assertIn('sync("quiz"', self.page)
+        self.assertIn('sync("pads"', self.page)
+
+    def test_saved_values_carry_the_time_they_were_written(self):
+        """Without a timestamp, a stale server copy would clobber newer local
+        work the first time the page is opened with the server back up."""
+        self.assertIn("t: Date.now()", self.page)
+
+    def test_the_server_port_comes_from_the_config(self):
+        """The port is configurable, so the page must not hard-code 8765."""
+        self.assertNotIn("__KANJI_PORT__", self.page)
+        self.assertIn(f"http://127.0.0.1:{config.port('ask_server_port')}", self.page)
+
+    def test_the_page_still_works_with_no_server(self):
+        """localStorage stays the synchronous first read, and every server call
+        is wrapped, so a page opened with ask_server down behaves as before."""
+        self.assertIn("localStorage.getItem", self.page)
+        self.assertIn("localStorage.setItem", self.page)
+
+
+class PageStateStoreTest(unittest.TestCase):
+    """ask_server's side of the same story: the durable copy on disk."""
+
+    def setUp(self) -> None:
+        import ask_server
+        self.ask_server = ask_server
+        self.tmp = tempfile.mkdtemp()
+        self._real_dir = ask_server.PAGE_STATE_DIR
+        ask_server.PAGE_STATE_DIR = Path(self.tmp)
+
+    def tearDown(self) -> None:
+        self.ask_server.PAGE_STATE_DIR = self._real_dir
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_a_page_id_is_not_used_as_a_filename_as_is(self):
+        """"daily:2026-09-16" has a colon in it, and a hostile caller could send
+        far worse — the port is reachable from any file:// page."""
+        name = self.ask_server.state_file("../../etc/passwd").name
+        self.assertNotIn("/", name)
+        self.assertNotIn("..", name)
+        self.assertEqual(self.ask_server.state_file("daily:2026-09-16").name,
+                         "daily_2026-09-16.json")
+
+    def test_saving_then_loading_returns_the_work(self):
+        self.ask_server.save_state("daily:2026-09-16",
+                                   {"quiz": {"v": ["しゅくはく"], "t": 100}})
+        self.assertEqual(self.ask_server.load_state("daily:2026-09-16"),
+                         {"quiz": {"v": ["しゅくはく"], "t": 100}})
+
+    def test_an_older_write_never_overwrites_a_newer_one(self):
+        """The browser may be ahead of the server (it was working while the
+        server was down) or behind it. The later write wins, not the last one
+        to arrive."""
+        self.ask_server.save_state("d", {"quiz": {"v": ["new"], "t": 200}})
+        self.ask_server.save_state("d", {"quiz": {"v": ["old"], "t": 100}})
+        self.assertEqual(self.ask_server.load_state("d")["quiz"]["v"], ["new"])
+
+    def test_one_key_does_not_erase_the_others(self):
+        """The pads are saved on a different rhythm from the quiz answers."""
+        self.ask_server.save_state("d", {"quiz": {"v": ["a"], "t": 1}})
+        self.ask_server.save_state("d", {"pads": {"v": {"雷": []}, "t": 2}})
+        self.assertEqual(sorted(self.ask_server.load_state("d")), ["pads", "quiz"])
+
+    def test_unknown_keys_are_dropped(self):
+        """Anything on the machine can POST here; only the page's own keys
+        are written to disk."""
+        self.ask_server.save_state("d", {"evil": {"v": "x", "t": 9},
+                                         "quiz": {"v": ["ok"], "t": 9}})
+        self.assertEqual(sorted(self.ask_server.load_state("d")), ["quiz"])
+
+    def test_an_oversized_write_is_refused(self):
+        with self.assertRaises(ValueError):
+            self.ask_server.save_state("d", {"pads": {"v": "x" * 5_000_000, "t": 1}})
+
+    def test_a_missing_file_reads_as_empty_rather_than_raising(self):
+        self.assertEqual(self.ask_server.load_state("never-written"), {})
 
 
 class SpeechTextTest(unittest.TestCase):

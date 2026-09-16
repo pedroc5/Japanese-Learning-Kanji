@@ -628,7 +628,11 @@ VOICEVOXの読み確認は自動で走るのでその結果を、muriapp/kanjika
   の実行が事前許可されている。出力先そのものへの `Read`/`Edit` はマシンごとに違うので
   追跡しない `.claude/settings.local.json` に書く（`README.md` の設定の項を参照）。
 - ページ内のチャット・まとめ機能は `ask_server.py`（`com.kanji-practice.ask-server`、launchdで常駐、
-  既定で `127.0.0.1:8765`）が動いていないと使えない。`launchctl list | grep kanji-ask-server` で
+  既定で `127.0.0.1:8765`）が動いていないと使えない。
+  **クイズの答えと書き取りの線の「消えない側」の保存先でもある**（`.page_state/`）。
+  localStorageだけだと、ブラウザの「閲覧履歴を消去」でサイトデータを選んだ時点で
+  全部消える（2026-09に実際に起きた）。サーバーが止まっていてもページは動くが、
+  そのときの保存はブラウザの中だけになる。`launchctl list | grep kanji-ask-server` で
   起動確認、ログは `<output_root>/ask_server.log`。サーバー内部の`claude -p`呼び出しも
   同じスキルフォルダの`.claude/settings.json`の許可を使うため、質問の内容によっては
   （未許可のツールを使おうとした場合など）応答がタイムアウトすることがある。

@@ -9,6 +9,12 @@ page loads) is mapped to a Claude Code session id, so follow-up questions
 use `claude -p --resume <session-id>` and keep the thread of conversation —
 no separate API key, just the existing Claude Code login on this machine.
 
+It also keeps the pages' own state — quiz answers, the 書き取り strokes, the
+chat thread id — on disk under .page_state/, so that work survives things the
+browser does not guarantee: clearing browsing data, a different browser or
+profile, a private window. The page writes to localStorage first (instant, and
+it still works with this server down) and mirrors here for durability.
+
     python ask_server.py [--port 8765]   # 既定は config.json の ask_server_port
 """
 
@@ -20,6 +26,7 @@ import re
 import subprocess
 import sys
 import threading
+import urllib.parse
 from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -31,6 +38,79 @@ import config  # noqa: E402
 CWD = Path(__file__).resolve().parent  # スキルフォルダ。.claude/settings.json の権限がここ基準で読み込まれる
 TIMEOUT = 180
 SUMMARY_TIMEOUT = 240
+
+# ページごとの保存状態（クイズの答え・書き取りの線・会話id）。
+#
+# なぜサーバー側にも持つのか：ページは file:// で開かれるので、localStorage の中身は
+# ブラウザの「サイトデータ」そのもの。「閲覧履歴を消去」でCookieとサイトデータを選べば、
+# その日の答えも書き取りも全部まとめて消える（2026-09に実際に起きた。8-31までの記録が
+# 残っていて、9月分が1日も無かった）。別のブラウザやプロファイル、シークレットウィンドウ
+# でも同じことになる。ここに置けば消えない。
+#
+# スキルフォルダに置く理由は .content/ と同じ：launchd下のこのプロセスが読み書きする
+# 必要があり、TCC保護下のフォルダでは既存ファイルを読み返せない（build_page.DEFAULT_HISTORY）。
+PAGE_STATE_DIR = CWD / ".page_state"
+
+# 書いてよいキー。ページ側が増やしたいときはここに足す。未知のキーは黙って捨てる
+# （file:// からは誰でも叩けるポートなので、ディスクに書く内容は絞っておく）。
+STATE_KEYS = ("quiz", "pads", "conv")
+
+# 1ページ分の上限。書き取りの線は点列なので一番大きいが、10字×5マス×全画でも
+# 数百KBに収まる。壊れた／悪意のある書き込みでディスクを埋めないための蓋。
+MAX_STATE_BYTES = 4 * 1024 * 1024
+
+_state_lock = threading.Lock()
+
+
+def state_file(page_id: str) -> Path:
+    """page_id をそのままファイル名にはしない（"daily:2026-09-16" の : や、
+    もっと悪いものが来る）。英数字・_・- 以外は全部 _ に潰す。
+
+    ドットも残さない。残すと "../.." が ".._.." のまま通り、フォルダから出られは
+    しないものの、"." や ".." のような名前を作れてしまう。ここで許す文字を最小に
+    しておくほうが、後から数え直すより安い。
+    """
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", page_id)[:120] or "unknown"
+    return PAGE_STATE_DIR / f"{safe}.json"
+
+
+def load_state(page_id: str) -> dict:
+    """そのページの保存状態。無ければ空。読めなくても落とさない。"""
+    try:
+        return json.loads(state_file(page_id).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(page_id: str, incoming: dict) -> dict:
+    """届いたキーだけを、より新しいほうを残して書き込む。
+
+    値は {"v": 中身, "t": 書いた時刻(ms)} の形で来る。サーバーが持っているものより
+    t が古い書き込みは捨てる — サーバーを止めている間にブラウザ側が進んでいることも、
+    その逆もあるので、どちらが新しいかは時刻で決める。返すのは書き込み後の全体。
+    """
+    with _state_lock:
+        current = load_state(page_id)
+        for key, entry in incoming.items():
+            if key not in STATE_KEYS or not isinstance(entry, dict) or "v" not in entry:
+                continue
+            when = entry.get("t")
+            when = when if isinstance(when, (int, float)) else 0
+            have = current.get(key)
+            if isinstance(have, dict) and isinstance(have.get("t"), (int, float)) and have["t"] > when:
+                continue
+            current[key] = {"v": entry["v"], "t": when}
+        blob = json.dumps(current, ensure_ascii=False)
+        if len(blob.encode("utf-8")) > MAX_STATE_BYTES:
+            raise ValueError("保存する状態が大きすぎます。")
+        PAGE_STATE_DIR.mkdir(parents=True, exist_ok=True)
+        # 一旦別名に書いてから差し替える。書いている最中に読まれても、
+        # 半分だけのJSONを掴むことがない。
+        tmp = state_file(page_id).with_suffix(".json.tmp")
+        tmp.write_text(blob, encoding="utf-8")
+        tmp.replace(state_file(page_id))
+        return current
+
 
 # conversation_id (browser-side) -> claude session_id. Grows for the life of the
 # process and is dropped on restart: at a handful of conversations a day that
@@ -227,12 +307,13 @@ def save_quiz_results(day: str, results: list[dict]) -> None:
 
 
 class Handler(BaseHTTPRequestHandler):
-    """Two endpoints, both POST: /ask (sidebar chat) and /summarize (まとめて)."""
+    """/ask and /summarize (POST) drive the sidebar; /state (GET and POST)
+    keeps each page's answers and strokes on disk."""
 
     def _cors(self) -> None:
         """Pages are opened as file:// URLs, so every request is cross-origin."""
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
     def _send_json(self, code: int, payload: dict) -> None:
@@ -249,13 +330,45 @@ class Handler(BaseHTTPRequestHandler):
         self._cors()
         self.end_headers()
 
+    def do_GET(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/state":
+            page_id = urllib.parse.parse_qs(parsed.query).get("page_id", [""])[0]
+            if not page_id:
+                self._send_json(400, {"error": "page_id がありません。"})
+                return
+            self._send_json(200, {"state": load_state(page_id)})
+        else:
+            self._send_json(404, {"error": "not found"})
+
     def do_POST(self) -> None:
         if self.path == "/ask":
             self._handle_ask()
         elif self.path == "/summarize":
             self._handle_summarize()
+        elif self.path == "/state":
+            self._handle_state()
         else:
             self._send_json(404, {"error": "not found"})
+
+    def _handle_state(self) -> None:
+        """POST /state — ページの下書き（答え・線・会話id）を書き留める。
+
+        claudeを呼ばないので速い。ページ側はキー入力のたびではなく、少し溜めてから
+        送ってくる（STORE_JS のデバウンス）。
+        """
+        try:
+            body = self._read_json()
+            page_id = (body.get("page_id") or "").strip()
+            state = body.get("state")
+            if not page_id or not isinstance(state, dict):
+                self._send_json(400, {"error": "リクエストが不正です。"})
+                return
+            self._send_json(200, {"state": save_state(page_id, state)})
+        except ValueError as e:
+            self._send_json(413, {"error": str(e)})
+        except Exception as e:                        # noqa: BLE001
+            self._send_json(500, {"error": f"エラー: {e}"})
 
     def _read_json(self) -> dict:
         """Parse the request body as JSON (empty body -> {})."""

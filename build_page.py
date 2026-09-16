@@ -569,6 +569,7 @@ PRACTICE_JS = """
   var SAMPLES = 16;                                  // GRADE_JS の N と揃える
   var store = window.__kanjiStore;
   var saved = store ? store.load("pads", {}) : {};
+  var blocks = [];                                   // 字ごとのマス。下の sync で書き戻す
 
   /* お手本の画を、マス目座標(0〜1)の点列として読み出す。
 
@@ -676,6 +677,7 @@ PRACTICE_JS = """
       redraw(entry);                                 // 前回の続きから
     };
     for (var b = 0; b < boxes; b++) _loop(b);
+    blocks.push({char: char, pads: pads});
 
     var checkBtn = block.querySelector(".checkPads");
     var toggleBtn = block.querySelector(".toggleModel");
@@ -709,6 +711,22 @@ PRACTICE_JS = """
         if (p.strokes.length) written++;
       });
       if (!written) pads[0].res.textContent = "まずマスに書いてみてください。";
+    });
+  });
+
+  /* ブラウザのサイトデータを消した後などは、書いた線がサーバー側にだけ残っている。
+     届いたらマスに描き直す。`saved` ごと差し替えるので、この後の保存も
+     （今開いている字だけでなく）サーバーの内容を土台に積み上がる。 */
+  if (store) store.sync("pads", function(remote){
+    if (!remote || typeof remote !== "object") return;
+    saved = remote;
+    blocks.forEach(function(b){
+      var boxesFor = saved[b.char] || [];
+      b.pads.forEach(function(p, i){
+        p.strokes = (boxesFor[i] || []).slice();
+        p.res.textContent = ""; p.res.className = "padres";
+        redraw(p);
+      });
     });
   });
 })();
@@ -775,8 +793,23 @@ CHAT_RESIZE_JS = """
 
 STORE_JS = """
 <script>
-/* ページごとの下書き保存。クイズの答えとチャットの会話はDOMの中にしか無く、まとめ機能も
-   そこから読むので、保存しないとリロードやタブを閉じた時点でその日の記録がまるごと消える。
+/* ページごとの下書き保存 — クイズの答え、書き取りの線、チャットの会話id。
+
+   **二段構え。** 速い側は localStorage：同期で読めるので、開いた瞬間に前回の続きが
+   出る。ただしページは file:// で開かれるので、その中身はブラウザから見れば
+   ただの「サイトデータ」で、**「閲覧履歴を消去」でCookieとサイトデータを選んだ
+   時点で全部消える**（2026-09に実際にそうなった。8-31までの記録は残っていて、
+   9月分が1日も無かった）。別のブラウザ・別のプロファイル・シークレットウィンドウ
+   でも同じ。消えて困るものをそこだけに置いてはいけない。
+
+   消えない側が ask_server の /state（スキルフォルダの .page_state/ に書く）。
+   保存のたびに少し溜めてから送り、閉じるときは sendBeacon で最後の分を押し出す。
+   開いたときは両方を見て、**書いた時刻(t)が新しいほう**を採る — サーバーを止めて
+   いる間にブラウザ側が進むことも、ブラウザのデータを消してサーバー側だけが残る
+   こともあるので、どちらが正しいかは時刻で決める。
+
+   サーバーが落ちていても、今までどおり localStorage だけで動く。
+
    保存先はページごと（data-page-id）に分けるので、日付が違えば混ざらない。
    このブロックは本文より前に置く必要がある — クイズのスクリプトが本文の中で使うため。 */
 (function(){
@@ -786,15 +819,114 @@ STORE_JS = """
 
   var id = document.body.getAttribute("data-page-id") || location.pathname;
   var PREFIX = "kanji:" + id + ":";
+  var BASE = "http://127.0.0.1:__KANJI_PORT__";
+  var STATE_URL = BASE + "/state";
+  var KEYS = ["quiz", "pads", "conv"];
+  window.__kanjiServer = BASE;          // チャットとまとめも同じサーバーを使う
+
+  /* localStorage には {v: 中身, t: 書いた時刻ms} で入れる。tが無い古い保存
+     （2026-09以前のページ）は t=0 の値として読む。 */
+  function readLocal(key){
+    try {
+      var raw = localStorage.getItem(PREFIX + key);
+      if (raw === null) return null;
+      var parsed = JSON.parse(raw);
+      var enveloped = parsed && typeof parsed === "object" && !Array.isArray(parsed)
+                      && parsed.hasOwnProperty("v") && parsed.hasOwnProperty("t");
+      return enveloped ? parsed : {v: parsed, t: 0};
+    } catch (e) { return null; }
+  }
+  function writeLocal(key, entry){
+    try { localStorage.setItem(PREFIX + key, JSON.stringify(entry)); } catch (e) {}
+  }
+
+  /* サーバーへの書き出し。1文字打つたびに飛ばさず、少し溜める。 */
+  var pending = {}, timer = null;
+  function payload(keys){
+    var out = {};
+    keys.forEach(function(k){ var e = readLocal(k); if (e) out[k] = e; });
+    return Object.keys(out).length ? JSON.stringify({page_id: id, state: out}) : null;
+  }
+  function flush(){
+    timer = null;
+    var keys = Object.keys(pending); pending = {};
+    var body = payload(keys);
+    if (!body) return;
+    // text/plain は単純リクエストなので、保存のたびにOPTIONSを往復しない。
+    // サーバーは Content-Type を見ずに本文をJSONとして読む。
+    try {
+      fetch(STATE_URL, {method: "POST", headers: {"Content-Type": "text/plain"},
+                        body: body}).catch(function(){});
+    } catch (e) {}
+  }
+  /* 閉じる・隠れる瞬間は fetch が間に合わないことがあるので sendBeacon で送る。
+     （タブを閉じても配送してくれるのはこれだけ。） */
+  function flushNow(){
+    if (timer) { clearTimeout(timer); timer = null; }
+    var keys = Object.keys(pending); pending = {};
+    var body = payload(keys);
+    if (!body) return;
+    try {
+      if (navigator.sendBeacon &&
+          navigator.sendBeacon(STATE_URL, new Blob([body], {type: "text/plain"}))) return;
+    } catch (e) {}
+    try {
+      fetch(STATE_URL, {method: "POST", headers: {"Content-Type": "text/plain"},
+                        body: body, keepalive: true}).catch(function(){});
+    } catch (e) {}
+  }
+  window.addEventListener("pagehide", flushNow);
+  document.addEventListener("visibilitychange", function(){
+    if (document.visibilityState === "hidden") flushNow();
+  });
+
+  /* 開いたときに一度だけサーバーを読む。落ちていれば null で解決する（失敗は
+     エラーにしない — サーバー無しでも動くのが前提）。 */
+  var ready = new Promise(function(resolve){
+    var done = false, finish = function(v){ if (!done) { done = true; resolve(v); } };
+    setTimeout(function(){ finish(null); }, 4000);     // 応答が無くても先へ進む
+    try {
+      fetch(STATE_URL + "?page_id=" + encodeURIComponent(id))
+        .then(function(r){ return r.ok ? r.json() : null; })
+        .then(function(d){ finish(d && d.state ? d.state : {}); })
+        .catch(function(){ finish(null); });
+    } catch (e) { finish(null); }
+  });
+
+  // ブラウザ側にだけある分をサーバーへ上げる（初回の引っ越し）。
+  ready.then(function(remote){
+    if (!remote) return;
+    var stale = KEYS.filter(function(k){
+      var l = readLocal(k), r = remote[k];
+      return l && (!r || (r.t || 0) < (l.t || 0));
+    });
+    if (stale.length){ stale.forEach(function(k){ pending[k] = true; }); flush(); }
+  });
+
   window.__kanjiStore = {
+    /* 同期で読む（localStorage）。ページの描画をサーバー待ちにしないため。 */
     load: function(key, fallback){
-      try {
-        var raw = localStorage.getItem(PREFIX + key);
-        return raw === null ? fallback : JSON.parse(raw);
-      } catch (e) { return fallback; }
+      var entry = readLocal(key);
+      return entry ? entry.v : fallback;
     },
     save: function(key, value){
-      try { localStorage.setItem(PREFIX + key, JSON.stringify(value)); } catch (e) {}
+      writeLocal(key, {v: value, t: Date.now()});
+      pending[key] = true;
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(flush, 800);
+    },
+    /* サーバーのほうが新しければ、その値で書き戻してもらう。
+       各画面（クイズ・書き取り・チャット）がそれぞれ自分の戻し方を渡す。 */
+    sync: function(key, apply){
+      ready.then(function(remote){
+        if (!remote) return;
+        var r = remote[key];
+        if (!r || !r.hasOwnProperty("v")) return;
+        var l = readLocal(key);
+        if (l && (l.t || 0) >= (r.t || 0)) return;
+        writeLocal(key, r);
+        try { apply(r.v); } catch (e) {}
+      });
     }
   };
 })();
@@ -809,7 +941,7 @@ CHAT_JS = """
    サーバー側でclaude -p --resumeに使うことで、リロードしても会話が続く。
    サーバーに繋がらない場合は、質問文をクリップボードにコピーするフォールバックに切り替える。 */
 (function(){
-  var ASK_URL = "http://127.0.0.1:8765/ask";
+  var ASK_URL = (window.__kanjiServer || "http://127.0.0.1:8765") + "/ask";
   var store = window.__kanjiStore;
   var convId = (store && store.load("conv", "")) ||
                ("c" + Date.now().toString(36) + Math.random().toString(36).slice(2));
@@ -974,7 +1106,7 @@ SUMMARIZE_JS = """
    ロジックを再利用して、ここで採点する）・チャットの会話をローカルサーバーに送り、
    まとめ_<date>.html を別ファイルとして作らせる。 */
 (function(){
-  var SUMMARIZE_URL = "http://127.0.0.1:8765/summarize";
+  var SUMMARIZE_URL = (window.__kanjiServer || "http://127.0.0.1:8765") + "/summarize";
   var btn = document.getElementById("summarizeBtn");
   var msg = document.getElementById("summarizeMsg");
   if (!btn) return;
@@ -1961,8 +2093,12 @@ def quiz_section(quiz: list[dict], chars: list[str],
   var store = window.__kanjiStore;
   var inputs = document.querySelectorAll("input.ans");
   if (store) {
-    var saved = store.load("quiz", []);
-    inputs.forEach(function(inp, i){ if (saved[i]) inp.value = saved[i]; });
+    var fill = function(values){
+      inputs.forEach(function(inp, i){ if (values[i]) inp.value = values[i]; });
+    };
+    fill(store.load("quiz", []));
+    // ブラウザのデータを消した後などは、サーバーのほうに答えが残っている。
+    store.sync("quiz", function(values){ if (values && values.length) fill(values); });
     var persist = function(){
       store.save("quiz", Array.prototype.map.call(inputs, function(i){ return i.value; }));
     };
@@ -2096,8 +2232,8 @@ def build(content: dict, strokes: dict[str, dict | None], content_file: str = ""
         f'<body data-content-file="{attr_esc(content_file)}" data-day="{attr_esc(day)}"'
         f' data-page-id="{attr_esc(page_id or day)}">',
         "",
-        banner("下書き保存（クイズの答え・チャット。本文より前に読み込む必要がある）"),
-        STORE_JS.strip("\n"),
+        banner("下書き保存（クイズの答え・書き取り・チャット。本文より前に読み込む必要がある）"),
+        STORE_JS.strip("\n").replace("__KANJI_PORT__", str(config.port("ask_server_port"))),
         "",
         banner("ふりがなトグル（左上に固定）"),
         furigana_toggle_html(),

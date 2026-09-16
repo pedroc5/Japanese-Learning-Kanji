@@ -43,6 +43,9 @@ Then, for the page as a whole:
 - **A chat sidebar** that talks to Claude about anything, and a まとめて button
   that writes a review of how the quiz went.
 
+Your quiz answers and the characters you trace are saved as you work, and are
+still there when you come back — see [Saved work](#saved-work).
+
 Once a character has appeared it is never used again: `kanji_history.json`
 records every kanji, theme and day, and the model reads it before choosing.
 
@@ -66,8 +69,9 @@ records every kanji, theme and day, and the model reads it before choosing.
 
   build_review.py       Friday: rolls the week's pages into one review, hardest
                         kanji first, using the quiz scores in the history
-  ask_server.py         a small loopback HTTP server the page's chat sidebar
-                        and まとめて button call
+  ask_server.py         a small loopback HTTP server: the page's chat sidebar,
+                        the まとめて button, and the durable copy of your
+                        answers and drawings (.page_state/)
 ```
 
 The daily run is `run_daily.sh`, invoked by launchd on weekday mornings. It
@@ -184,6 +188,31 @@ Three back ends, chosen with `--tts-engine`:
   but judged less natural here. The code is kept; the venv and models are not
   shipped. Asking for it without them falls back to VOICEVOX.
 
+## Saved work
+
+Quiz answers, the strokes you draw in the tracing boxes and the chat thread are
+saved as you go, and restored when you reopen the page.
+
+They are kept in **two places**, because one is not enough:
+
+- **`localStorage`** — instant and synchronous, so the page comes back with your
+  work already in it before anything else loads. But a page opened as a
+  `file://` URL is just "site data" to the browser: **clearing browsing data
+  wipes every page's answers and drawings at once**, and a different browser, a
+  different profile or a private window never sees them.
+- **`.page_state/<page>.json` in the skill folder**, written through
+  `ask_server`'s `/state` endpoint. This is the copy that survives all of the
+  above. The page mirrors to it as you work (debounced, plus a `sendBeacon` on
+  close so the last keystrokes are not lost).
+
+On open, the page reads `localStorage` immediately, then asks the server; each
+saved value carries the time it was written, and **the newer copy wins**. That
+matters in both directions — you may have worked with the server down, or
+cleared your browser with the server holding the only copy.
+
+With `ask_server` not running, everything still works exactly as it did before:
+`localStorage` alone, no errors, no waiting.
+
 ## Repository layout
 
 | File | What it is |
@@ -201,7 +230,7 @@ Three back ends, chosen with `--tts-engine`:
 | `INSTALL.md` | Full setup walkthrough. |
 
 Untracked, created as you use it: `config.json`, `.claude/settings.local.json`,
-`kanji_history.json`, `.content/`, `.quiz_results/`, the caches
+`kanji_history.json`, `.content/`, `.quiz_results/`, `.page_state/`, the caches
 (`.kanjivg_cache/`, `.vv_cache/`, `.tts_cache/`, `.sbv2_cache/`) and
 `.elevenlabs_key`.
 
