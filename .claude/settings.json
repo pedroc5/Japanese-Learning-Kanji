@@ -1,17 +1,16 @@
 {
+  "//": "Permissions for unattended runs. Deliberately free of absolute paths so the repo works from any checkout: the commands below are the ones run_daily.sh issues after cd-ing into the skill folder. Anything tied to THIS machine — the output root, your own home directory — belongs in .claude/settings.local.json, which is not tracked. See README.md.",
   "permissions": {
     "allow": [
       "WebFetch(domain:jlptsensei.com)",
-      "Bash(python3 /Users/pedrocoutinho/.claude/skills/kanji-practice/build_page.py *)",
-      "Bash(python3 /Users/pedrocoutinho/.claude/skills/kanji-practice/build_review.py *)",
-      "Bash(python3 /Users/pedrocoutinho/.claude/skills/kanji-practice/test_build_page.py)",
+      "WebFetch(domain:jisho.org)",
       "WebFetch(domain:elevenlabs.io)",
-      "Bash(python3 /Users/pedrocoutinho/.claude/skills/kanji-practice/tts.py *)",
-      "Bash(conda run -n kanji python /Users/pedrocoutinho/.claude/skills/kanji-practice/build_page.py *)",
-      "Bash(conda run -n kanji python /Users/pedrocoutinho/.claude/skills/kanji-practice/build_review.py *)",
-      "Edit(/tmp/kanji_content.json)",
-      "Edit(/Users/pedrocoutinho/Documents/Claude-JP/**)",
-      "Read(/Users/pedrocoutinho/Documents/Claude-JP/**)"
+      "Bash(python3 build_page.py *)",
+      "Bash(python3 build_review.py *)",
+      "Bash(python3 test_build_page.py)",
+      "Bash(python3 tts.py *)",
+      "Bash(python3 voicevox.py *)",
+      "Bash(python3 config.py)"
     ]
   }
 }

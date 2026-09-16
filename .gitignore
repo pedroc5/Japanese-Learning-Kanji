@@ -2,6 +2,10 @@ __pycache__/
 *.pyc
 .kanjivg_cache/
 
+# このマシン固有の設定（出力先など）。追跡するのは config.example.json のほう。
+config.json
+
+# このマシン固有の権限設定（出力先への Read/Edit など）。追跡するのは .claude/settings.json のほう。
 .claude/settings.local.json
 
 # まとめて を押したときのクイズの成績。次のビルドが履歴に取り込んで消す一時ファイル

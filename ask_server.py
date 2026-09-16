@@ -2,14 +2,14 @@
 """Local HTTP server the kanji-practice pages call to chat with Claude live
 and show the answer inline, instead of copy-pasting into a terminal.
 
-Runs as a background launchd service (com.pedro.kanji-ask-server.plist,
+Runs as a background launchd service (com.kanji-practice.ask-server.plist,
 started via run_ask_server.sh) so it's already up whenever a practice page
 is opened. Each browser-side conversation (a random id generated when the
 page loads) is mapped to a Claude Code session id, so follow-up questions
 use `claude -p --resume <session-id>` and keep the thread of conversation —
-no separate API key, just Pedro's existing Claude Code login.
+no separate API key, just the existing Claude Code login on this machine.
 
-    python ask_server.py [--port 8765]
+    python ask_server.py [--port 8765]   # 既定は config.json の ask_server_port
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import build_page  # noqa: E402  (reuse the same CSS as 漢字練習_*.html for a consistent look)
+import config  # noqa: E402
 
 CWD = Path(__file__).resolve().parent  # スキルフォルダ。.claude/settings.json の権限がここ基準で読み込まれる
 TIMEOUT = 180
@@ -143,13 +144,13 @@ def summary_prompt(content_file: str, summary_path: str, day: str,
                    quiz_results: list[dict], chat: list[dict]) -> str:
     """Build the instruction for the nested `claude -p` that writes まとめ_<date>.html."""
     quiz_lines = [
-        f"- 問題「{r.get('q', '')}」／Pedroの解答「{r.get('given') or '(空欄)'}」／判定：{r.get('verdict', '?')}"
+        f"- 問題「{r.get('q', '')}」／学習者の解答「{r.get('given') or '(空欄)'}」／判定：{r.get('verdict', '?')}"
         for r in quiz_results
     ]
     quiz_block = "\n".join(quiz_lines) or "(クイズの解答はまだ入力されていません)"
 
     chat_lines = [
-        f"{'Pedro' if m.get('who') == 'you' else 'Claude'}: {m.get('text', '')}"
+        f"{'学習者' if m.get('who') == 'you' else 'Claude'}: {m.get('text', '')}"
         for m in chat if m.get("text")
     ]
     chat_block = "\n".join(chat_lines) or "(チャットでの質問はありませんでした)"
@@ -157,7 +158,7 @@ def summary_prompt(content_file: str, summary_path: str, day: str,
     return (
         "（ファイル操作はReadツールとWriteツールだけを使ってください。"
         "catやlsなどのBashは使わないでください。）\n\n"
-        f"{content_file} を読んで、今日の漢字練習（Pedro、JLPT学習者向け）の振り返りまとめを"
+        f"{content_file} を読んで、今日の漢字練習（JLPT学習者向け）の振り返りまとめを"
         "作成してください。クイズの正誤はブラウザ側で既に判定済みなので、以下の結果をそのまま使い、"
         "ファイルを読み直して採点し直す必要はありません。\n\n"
         f"【クイズの結果（ブラウザ側で判定済み）】\n{quiz_block}\n\n"
@@ -189,8 +190,8 @@ def summary_prompt(content_file: str, summary_path: str, day: str,
 def summary_target(content_file: str) -> tuple[str, str]:
     """content_<date>.json の名前から (その日の日付, まとめの書き出し先) を決める。
 
-    まとめはPedroが読むページなので、その日の漢字練習ページと同じ週フォルダ
-    （~/Documents/Claude-JP/漢字/<週>/）に置く。**内容JSONの隣ではない**：内容JSONは
+    まとめは学習者が読むページなので、その日の漢字練習ページと同じ週フォルダ
+    （<output_root>/<週>/）に置く。**内容JSONの隣ではない**：内容JSONは
     TCCの都合でスキルフォルダへ移してあり（build_page.DEFAULT_CONTENT_DIR）、
     そこを基準にするとまとめまでスキルフォルダに紛れ込む。
     日付として読めない名前のときは今日の日付にする（週フォルダの計算に日付が要るため）。
@@ -209,7 +210,7 @@ def save_quiz_results(day: str, results: list[dict]) -> None:
     results are dropped here instead and build_page.ingest_quiz_results() folds
     them into the history on the next daily run.
 
-    Best-effort: a failure here must not cost Pedro his まとめ, so it is
+    Best-effort: a failure here must not cost the learner their まとめ, so it is
     reported and swallowed.
     """
     attempted = [r for r in results if r.get("char") and r.get("verdict") != "未回答"]
@@ -303,10 +304,11 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_summarize(self) -> None:
         """Build and write まとめ_<date>.html for today's class.
 
-        This process deliberately never touches ~/Documents/Claude-JP itself.
-        A launchd-spawned python3 has no Full Disk / Files-and-Folders grant
-        for that (TCC-protected) folder, so any direct os/pathlib read here
-        fails with EPERM — even though the same code works when the server is
+        This process deliberately never touches the output root itself.
+        When that root is under ~/Documents (or ~/Desktop, ~/Downloads), a
+        launchd-spawned python3 has no Full Disk / Files-and-Folders grant for
+        it, so any direct os/pathlib read here fails with EPERM — even though
+        the same code works when the server is
         started by hand from Terminal, which inherits Terminal's own grant.
         The `claude` binary is unaffected and already reads/writes there fine,
         so all file access is delegated to the nested `claude -p` call. Quiz
@@ -374,7 +376,8 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="漢字練習ページ用のローカル会話サーバー")
-    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--port", type=int, default=config.port("ask_server_port"),
+                        help="待ち受けるポート（既定：config.jsonのask_server_port）")
     args = parser.parse_args()
 
     # Threaded so a long まとめ call doesn't block the chat sidebar; bound to

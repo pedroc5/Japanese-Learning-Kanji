@@ -42,12 +42,16 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+import config
+
 HERE = Path(__file__).resolve().parent
 
-ENGINE = "http://127.0.0.1:50021"
+# エンジンの場所は環境ごとに違うので config.py から読む（config.json の
+# voicevox_engine_url / voicevox_engine_binary、または環境変数で差し替え可能）。
+ENGINE = str(config.get("voicevox_engine_url"))
 # VOICEVOX.app に同梱されているエンジン本体。アプリを開かなくてもこれだけで動く
 # ので、launchdからの9時のビルドはアプリのウィンドウを出さずに済む。
-ENGINE_BINARY = Path("/Applications/VOICEVOX.app/Contents/Resources/vv-engine/run")
+ENGINE_BINARY = config.path("voicevox_engine_binary")
 
 # 話者。男女2人ずつ、いずれも素直な読み上げ調のものを選んである（ElevenLabsで
 # 4声を回していたのと同じ理由：一つの声で1ページ通すと単調で、同じ語を別の声で

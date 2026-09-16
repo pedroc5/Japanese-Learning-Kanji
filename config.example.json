@@ -1,0 +1,9 @@
+{
+  "_comment": "Copy to config.json and edit. Every key is optional — leave one out and the built-in default in config.py applies. config.json is not tracked by git.",
+
+  "output_root": "~/Documents/kanji-practice",
+  "ask_server_port": 8765,
+  "voicevox_engine_url": "http://127.0.0.1:50021",
+  "voicevox_engine_binary": "/Applications/VOICEVOX.app/Contents/Resources/vv-engine/run",
+  "launchd_prefix": "com.kanji-practice"
+}

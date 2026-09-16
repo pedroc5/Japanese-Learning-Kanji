@@ -14,9 +14,10 @@ JLPT学習者向けの毎日の漢字練習HTMLを作る。文章はすべて**�
 `~/.claude/skills/kanji-practice/kanji_history.json` を読む。これが**全期間の履歴**（`build_page.py`/`build_review.py`
 が毎回自動更新する）で、直近のファイルだけを見るのではなく、ここに載っている字は**一度でも出したら二度と出さない**。
 
-> 履歴と内容JSON（`.content/content_<date>.json`）は `~/Documents` ではなく**スキルフォルダ**に置く。
-> `~/Documents` はTCC保護下で、launchdから動くプロセスは新規ファイルを作れても既存ファイルを
-> 読み返せない（EPERM）。2026-08-07の金曜、`build_review.py` がこれで落ちて復習ページが作られなかった。
+> 履歴と内容JSON（`.content/content_<date>.json`）は出力先ではなく**スキルフォルダ**に置く。
+> macOSの `~/Documents`・`~/Desktop`・`~/Downloads` はTCC保護下で、launchdから動くプロセスは
+> 新規ファイルを作れても既存ファイルを読み返せない（EPERM）。2026-08-07の金曜、`build_review.py`
+> がこれで落ちて復習ページが作られなかった。出力先をどこに設定してもこの2つはスキルフォルダに置く。
 
 - `history["kanji"]` … これまでに使った字とレベル・テーマ・使用日の辞書。候補の字はここと必ず突き合わせる。
 - `history["days"]` … 日ごとの記録（テーマ・その日の字・kind: daily/extra/review）。直近のテーマ傾向を見るのに使う。
@@ -338,11 +339,12 @@ python3 ~/.claude/skills/kanji-practice/build_page.py "${KANJI_CONTENT_JSON:-/tm
   履歴へ書くのは毎朝のこのビルドの役目。取り込んだファイルは二重計上を防ぐため消す。
   記録は字ごとの `{"asked": n, "wrong": n, "last": "<date>"}`。
 
-出力先は **その週のフォルダ**：`~/Documents/Claude-JP/漢字/<月曜〜日曜>/漢字練習_<date>.html`
-（例：`~/Documents/Claude-JP/漢字/2026-08-03〜08-09/漢字練習_2026-08-05.html`）。
+出力先は **その週のフォルダ**：`<output_root>/<月曜〜日曜>/漢字練習_<date>.html`
+（例：`<output_root>/2026-08-03〜08-09/漢字練習_2026-08-05.html`）。
+`output_root` は `config.json` の設定（既定は `~/Documents/kanji-practice`。`config.py` 参照）。
 フォルダ名は `build_page.week_folder()` が日付から決める（月曜始まり・日曜終わり、名前順＝時系列）。
 無ければ自動で作られるので、事前に用意しなくてよい。その週のページ・まとめ・復習が
-1つのフォルダにまとまる。ログは今までどおり `漢字/` 直下。
+1つのフォルダにまとまる。ログは `output_root` 直下。
 `kanji_history.json` と内容JSON（`.content/`）だけはスキルフォルダ側（TCCのため・上記参照）。
 
 オプション:
@@ -609,8 +611,8 @@ VOICEVOXの読み確認は自動で走るのでその結果を、muriapp/kanjika
 - `svgpathtools`, `Pillow`, `requests` が必要（conda環境 `kanji` に入っている）。
   ただしこれは `kanji_gif.py` の話で、`build_page.py`・`build_review.py`・`tts.py` は
   標準ライブラリだけで動く（毎朝の自動実行はシステムの python3）。
-- 平日（月〜金）9:00に launchd（`com.pedro.kanji-daily`）が自動実行する（時刻の実体は
-  `com.pedro.kanji-daily.plist` の `StartCalendarInterval`）。学習者が日中に追加のクラスを
+- 平日（月〜金）9:00に launchd（`com.kanji-practice.daily`）が自動実行する（時刻の実体は
+  `com.kanji-practice.daily.plist` の `StartCalendarInterval`）。学習者が日中に追加のクラスを
   頼んできたときは、上記の `--kind extra --append` の手順でその日のページに合流させればよい
   （自動実行や翌日以降のスケジュールを妨げない）。
 - **予約実行と対話セッションのかち合いについて。** 内容JSONは実行ごとに別パスになったので
@@ -623,13 +625,13 @@ VOICEVOXの読み確認は自動で走るのでその結果を、muriapp/kanjika
 - 自動実行は `claude -p "/kanji-practice" --permission-mode acceptEdits`（`run_daily.sh`）で行われる。
   カレントディレクトリはこのスキルフォルダ自身（`~/.claude/skills/kanji-practice/`）にしてあり、
   そこにある `.claude/settings.json` で、jlptsensei.comへのWebFetchや`build_page.py`/`build_review.py`
-  の実行、`~/Documents/Claude-JP/`配下への書き込みが事前許可されている
-  （出力先自体は変わらず `~/Documents/Claude-JP/漢字/` のまま）。
-- ページ内のチャット・まとめ機能は `ask_server.py`（`com.pedro.kanji-ask-server`、launchdで常駐、
-  `127.0.0.1:8765`）が動いていないと使えない。`launchctl list | grep kanji-ask-server` で起動確認、
-  ログは `~/Documents/Claude-JP/漢字/ask_server.log`。サーバー内部の`claude -p`呼び出しも
+  の実行が事前許可されている。出力先そのものへの `Read`/`Edit` はマシンごとに違うので
+  追跡しない `.claude/settings.local.json` に書く（`README.md` の設定の項を参照）。
+- ページ内のチャット・まとめ機能は `ask_server.py`（`com.kanji-practice.ask-server`、launchdで常駐、
+  既定で `127.0.0.1:8765`）が動いていないと使えない。`launchctl list | grep kanji-ask-server` で
+  起動確認、ログは `<output_root>/ask_server.log`。サーバー内部の`claude -p`呼び出しも
   同じスキルフォルダの`.claude/settings.json`の許可を使うため、質問の内容によっては
   （未許可のツールを使おうとした場合など）応答がタイムアウトすることがある。
 - インタラクティブに`claude`を起動して手動でこのスキルを試すときも、同じ権限を自動適用させたいなら
-  `~/Documents/Claude-JP`ではなく`~/.claude/skills/kanji-practice`から起動するとよい
+  出力先ではなく`~/.claude/skills/kanji-practice`から起動するとよい
   （`.claude/settings.json`はカレントディレクトリ基準で読み込まれるため）。

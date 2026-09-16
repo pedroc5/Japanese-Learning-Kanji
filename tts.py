@@ -9,7 +9,8 @@ are most of what this module is:
   + the exact text, so a rerun of the same day (the `--append` extra class, a
   retried launchd run, Friday's review page reusing a sentence) costs nothing
   and takes no time. Credits are only spent on text never spoken before.
-* **The cache lives in the skill folder**, not beside the page. ~/Documents is
+* **The cache lives in the skill folder**, not beside the page. A TCC-protected
+  output root (anything under ~/Documents, ~/Desktop or ~/Downloads) is
   TCC-protected and a launchd process cannot read back files there — the same
   reason kanji_history.json and .content/ sit here (see build_page.py). The
   mp3s written next to the page are write-only as far as this code is
@@ -570,7 +571,7 @@ def write_clips(clips: dict[str, bytes], out_dir: Path,
     name and the page is opened over file://.
 
     Written unconditionally, never checked for existence first: under launchd
-    ~/Documents can be written but not read back (TCC), so "is it already
+    A TCC-protected output root can be written but not read back, so "is it already
     there?" is a question this code is not allowed to ask. The bytes are free
     — they come from the cache in the skill folder.
     """
@@ -691,7 +692,7 @@ def speak_page(texts: list[str], page: Path, *, voice: str = DEFAULT_VOICE,
     try:
         urls = write_clips(clips, audio_dir_for(page), pairs, model, fmt, language)
     except OSError as error:
-        # ~/Documents is TCC-protected and the daily build runs under launchd.
+        # A TCC-protected output root plus launchd means the same EPERM as above.
         # Writing there has always worked, but if it ever stops, that must cost
         # the page its play buttons — not the page itself. The clips are already
         # in the cache, so the next successful run writes them out for free.

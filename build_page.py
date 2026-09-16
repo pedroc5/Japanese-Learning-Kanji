@@ -8,11 +8,12 @@ it as inline SVG, and assembling the page.
     python build_page.py content.json
     python build_page.py content.json --out ~/somewhere/漢字練習_2026-08-02.html
 
-Output goes to a folder per week — ~/Documents/Claude-JP/漢字/2026-07-27〜08-02/ —
-so a day's page and its まとめ sit together with that week's 復習 page (see
-week_folder()). The content JSON behind each page is the one piece kept out of
-there, in the skill folder, because launchd has to read it back (see
-DEFAULT_CONTENT_DIR).
+Output goes to a folder per week under the configured output root —
+<output_root>/2026-07-27〜08-02/ — so a day's page and its まとめ sit together
+with that week's 復習 page (see week_folder()). The root is `output_root` in
+config.json (see config.py); nothing here hard-codes a folder. The content
+JSON behind each page is the one piece kept out of there, in the skill folder,
+because launchd has to read it back (see DEFAULT_CONTENT_DIR).
 
 The page carries its own CSS and JS, but no longer its own audio: the spoken
 example and quiz sentences are mp3s in a 漢字練習_<date>_audio/ folder beside
@@ -35,6 +36,7 @@ import xml.etree.ElementTree as ET
 from datetime import date, timedelta
 from pathlib import Path
 
+import config
 import sbv2
 import tts
 import voicevox
@@ -42,29 +44,33 @@ import voicevox
 HERE = Path(__file__).resolve().parent
 DEFAULT_SVG_CACHE = HERE / ".kanjivg_cache"
 KVG_RAW = "https://raw.githubusercontent.com/KanjiVG/kanjivg/master/kanji/{cp}.svg"
-DEFAULT_ROOT = Path.home() / "Documents" / "Claude-JP" / "漢字"
+# ページとログの置き場。ここだけは人それぞれなので config.py 経由で読む
+# （config.json / KANJI_OUTPUT_ROOT で差し替えられる）。
+DEFAULT_ROOT = config.path("output_root")
 
 # 履歴だけは出力先（DEFAULT_ROOT）から切り離してスキルフォルダに置く。
-# ~/Documents はTCC保護下にあり、launchdから動くプロセス（毎朝の run_daily.sh と
-# ask_server.py）には Files-and-Folders の許可がない。その状態でも「新しいファイルを
-# 作る」ことはできるので毎日のHTML生成は通るが、フォルダの一覧と、他のプロセスが
-# 作った既存ファイルの読み込みは EPERM で弾かれる。履歴は読んで書き直すファイルなので
-# ~/Documents では成立しない（2026-08-07の金曜、build_review.py がまさにこれで落ちた）。
-# スキルフォルダは保護対象外で、launchd下でも読み書きできる。
+# macOSの ~/Documents・~/Desktop・~/Downloads はTCC保護下にあり、launchdから動く
+# プロセス（毎朝の run_daily.sh と ask_server.py）には Files-and-Folders の許可が
+# ない。その状態でも「新しいファイルを作る」ことはできるので毎日のHTML生成は通るが、
+# フォルダの一覧と、他のプロセスが作った既存ファイルの読み込みは EPERM で弾かれる。
+# 履歴は読んで書き直すファイルなので、出力先がその保護下にあると成立しない
+# （2026-08-07の金曜、build_review.py がまさにこれで落ちた）。スキルフォルダは
+# 保護対象外で、launchd下でも読み書きできるため、出力先の設定に関わらずここに置く。
 DEFAULT_HISTORY = HERE / "kanji_history.json"
 
 # Quiz results dropped here by ask_server.py when まとめて is pressed, and folded
 # into kanji_history.json by the next daily build. The detour originally existed
-# because the history sat in ~/Documents where ask_server.py could not write it;
+# because the history sat under the output root, which ask_server.py could not
+# write when that root was TCC-protected;
 # now that the history is here too, that reason is gone, but the staging stays:
 # the daily build rewrites the history file whole, so letting the always-on
 # server write it directly would race that rewrite and lose records.
 QUIZ_RESULTS_DIR = HERE / ".quiz_results"
 
-# その日の内容JSON。ページ本体（HTML）は今までどおり ~/Documents/Claude-JP/漢字 の
-# 週フォルダに置くが、このJSONだけはスキルフォルダに置く。金曜の build_review.py と
-# ask_server.py の「まとめて」は、どちらもlaunchd下からこれを *読む* 必要があり、
-# ~/Documents では EPERM で読めない（DEFAULT_HISTORY のコメント参照）。
+# その日の内容JSON。ページ本体（HTML）は今までどおり出力先（output_root）の週フォルダに
+# 置くが、このJSONだけはスキルフォルダに置く。金曜の build_review.py と ask_server.py の
+# 「まとめて」は、どちらもlaunchd下からこれを *読む* 必要があり、出力先がTCC保護下だと
+# EPERM で読めない（DEFAULT_HISTORY のコメント参照）。
 DEFAULT_CONTENT_DIR = HERE / ".content"
 
 
@@ -2121,7 +2127,7 @@ def build(content: dict, strokes: dict[str, dict | None], content_file: str = ""
 def week_folder(day: str) -> str:
     """「2026-08-03〜08-09」 — the Monday-to-Sunday week a date belongs to.
 
-    One folder per week keeps ~/Documents/Claude-JP/漢字 navigable: a day's
+    One folder per week keeps the output root navigable: a day's
     page and its まとめ live together with the week's 復習 page instead of
     piling up as a flat list of dated files. The folder starts with the
     Monday's full date so the folders sort chronologically by name.
@@ -2143,7 +2149,7 @@ def content_json_path(out: Path, content_dir: Path = DEFAULT_CONTENT_DIR) -> Pat
 
     The name is derived from the page, but the file lands in `content_dir`
     (the skill folder), not beside the page: build_review.py and ask_server.py
-    both read it from launchd, where ~/Documents is unreadable.
+    both read it from launchd, where a TCC-protected output root is unreadable.
     """
     stem = (out.stem.replace("漢字練習", "content", 1) if "漢字練習" in out.stem
             else f"content_{out.stem}")
@@ -2227,7 +2233,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="漢字練習HTMLを組み立てる")
     parser.add_argument("content", type=Path, help="内容を書いたJSONファイル")
     parser.add_argument("--out", type=Path,
-                        help="出力HTML（既定：~/Documents/Claude-JP/漢字/<その週>/漢字練習_<date>.html）")
+                        help="出力HTML（既定：<output_root>/<その週>/漢字練習_<date>.html）")
     parser.add_argument("--svg-cache", type=Path, default=DEFAULT_SVG_CACHE,
                         help="KanjiVGのSVGを置くキャッシュ（既定：スキルフォルダの.kanjivg_cache）")
     parser.add_argument("--skip-strokes", action="store_true",
@@ -2237,7 +2243,7 @@ def main() -> int:
                              "review=金曜の週次復習")
     parser.add_argument("--history", type=Path, default=DEFAULT_HISTORY, help="履歴JSONのパス")
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT,
-                        help="出力の置き場（既定：~/Documents/Claude-JP/漢字）")
+                        help=f"出力の置き場（既定：{DEFAULT_ROOT}。config.jsonのoutput_rootで変えられる）")
     parser.add_argument("--content-out", type=Path,
                         help="コンテンツJSONの保存先（既定：out横のcontent_<date>.json）")
     parser.add_argument("--no-audio", action="store_true",
@@ -2292,7 +2298,7 @@ def main() -> int:
     content = json.loads(args.content.read_text(encoding="utf-8"))
     day = content.get("date") or date.today().isoformat()
     # 既定の置き場は週ごとのフォルダ（--root を変えたときはその下）。履歴の場所とは
-    # 独立している：履歴はスキルフォルダ、ページは ~/Documents/Claude-JP/漢字。
+    # 独立している：履歴はスキルフォルダ、ページは output_root の下。
     out = args.out or day_page_path(day, args.root)
     content_out = args.content_out or content_json_path(out)
 
@@ -2335,7 +2341,7 @@ def main() -> int:
     history = load_history(args.history)
     dupes = update_history(history, content, args.kind, day, str(content_out))
     # Earlier days' quiz scores are only reachable from here: the chat server
-    # that collects them can't write into ~/Documents/Claude-JP itself.
+    # that collects them can't write into the output root itself.
     graded = ingest_quiz_results(history)
     save_history(args.history, history)
 

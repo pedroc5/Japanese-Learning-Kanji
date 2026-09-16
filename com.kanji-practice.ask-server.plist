@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.pedro.kanji-ask-server</string>
+  <string>com.kanji-practice.ask-server</string>
 
   <key>ProgramArguments</key>
   <array>

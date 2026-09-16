@@ -27,6 +27,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import build_page  # noqa: E402
+import config  # noqa: E402
 import voicevox  # noqa: E402
 import build_review  # noqa: E402
 import tts  # noqa: E402
@@ -350,19 +351,20 @@ class WeekFolderTest(unittest.TestCase):
         self.assertEqual(sorted(names), ["2026-08-31〜09-06", "2026-12-28〜01-03",
                                          "2027-01-04〜01-10"])
 
-    def test_the_content_json_is_named_after_its_page_but_kept_out_of_documents(self):
-        """The page goes to ~/Documents; its content JSON does not.
+    def test_the_content_json_is_named_after_its_page_but_kept_in_the_skill_folder(self):
+        """The page goes to the configured output root; its content JSON does not.
 
-        launchd (the Friday review, the chat server) can create files under
-        ~/Documents but cannot read them back, so the JSON those two have to
-        re-read lives in the skill folder instead — named after the page.
+        launchd (the Friday review, the chat server) can create files under a
+        TCC-protected root but cannot read them back, so the JSON those two
+        have to re-read lives in the skill folder instead — named after the
+        page, and wherever the output root happens to point.
         """
         page = build_page.day_page_path("2026-08-05", Path("/tmp/漢字"))
         self.assertEqual(page, Path("/tmp/漢字/2026-08-03〜08-09/漢字練習_2026-08-05.html"))
         self.assertEqual(build_page.content_json_path(page).name, "content_2026-08-05.json")
         self.assertEqual(build_page.content_json_path(page).parent,
                          build_page.DEFAULT_CONTENT_DIR)
-        self.assertNotIn("Documents", str(build_page.content_json_path(page)))
+        self.assertEqual(build_page.content_json_path(page).parent, build_page.HERE / ".content")
 
     def test_a_caller_can_still_redirect_the_content_json(self):
         page = build_page.day_page_path("2026-08-05", Path("/tmp/漢字"))
@@ -560,7 +562,7 @@ class SummaryTargetTest(unittest.TestCase):
 
     These were the same folder until the content JSON moved to the skill folder
     to get out of TCC's way; deriving the まとめ path from the content file then
-    silently started writing it into the skill folder instead of ~/Documents.
+    silently started writing it into the skill folder instead of the output root.
     """
 
     def test_the_summary_sits_beside_the_day_page(self):
@@ -577,7 +579,8 @@ class SummaryTargetTest(unittest.TestCase):
         content = str(build_page.DEFAULT_CONTENT_DIR / "content_2026-08-12.json")
         _, target = ask_server.summary_target(content)
         self.assertNotEqual(Path(target).parent, build_page.DEFAULT_CONTENT_DIR)
-        self.assertIn("Documents", target)
+        # Under the output root, wherever config.json points it — not the skill folder.
+        self.assertEqual(Path(target).parent.parent, build_page.DEFAULT_ROOT)
 
     def test_an_undated_name_falls_back_to_today(self):
         import ask_server

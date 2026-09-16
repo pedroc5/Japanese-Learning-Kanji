@@ -288,7 +288,7 @@ def main() -> int:
                         help="この日を含む週を復習する（既定：今日）")
     parser.add_argument("--history", type=Path, default=build_page.DEFAULT_HISTORY)
     parser.add_argument("--root", type=Path, default=build_page.DEFAULT_ROOT,
-                        help="出力の置き場（既定：~/Documents/Claude-JP/漢字）")
+                        help="出力の置き場（既定：config.jsonのoutput_root）")
     parser.add_argument("--out", type=Path,
                         help="出力HTML（既定：<root>/<その週>/復習_<date>.html）")
     parser.add_argument("--no-writing", action="store_true",

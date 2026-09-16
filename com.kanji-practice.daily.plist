@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.pedro.kanji-daily</string>
+  <string>com.kanji-practice.daily</string>
 
   <key>ProgramArguments</key>
   <array>
@@ -17,7 +17,7 @@
        起こされた2秒のdark wakeの中でclaudeが死に、その日のページが作られな
        かった（08-12も同じ、08-13・08-14もおそらく同じ）。launchdは逃した回を
        次の目覚めに1度だけ回すので、それが今回のように短いdark wakeだと一日
-       まるごと落ちる。昼と夕方にもう2回起きれば、そのうち1回はPedroがMacを
+       まるごと落ちる。昼と夕方にもう2回起きれば、そのうち1回は学習者がMacを
        開けている時間に当たる。既にその日のページがあるときは run_daily.sh が
        何もせず終わるので、成功した日に二度書きすることはない。 -->
   <key>StartCalendarInterval</key>
